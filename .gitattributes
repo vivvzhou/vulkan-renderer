@@ -1,0 +1,27 @@
+# Normalize line endings: store as LF in the repo, regardless of OS.
+# Keeps Windows (CRLF) and Linux/WSL2 (LF) builds from churning whole files.
+* text=auto eol=lf
+
+# Explicit text types
+*.cpp           text eol=lf
+*.hpp           text eol=lf
+*.h             text eol=lf
+*.glsl          text eol=lf
+*.vert          text eol=lf
+*.frag          text eol=lf
+*.comp          text eol=lf
+*.cmake         text eol=lf
+CMakeLists.txt  text eol=lf
+*.md            text eol=lf
+*.json          text eol=lf
+*.py            text eol=lf
+
+# Binary assets (never normalize)
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.hdr  binary
+*.ktx  binary
+*.bin  binary
+*.glb  binary
+*.spv  binary
