@@ -71,11 +71,12 @@ set(ASSET_PATH "${damagedhelmet_SOURCE_DIR}/DamagedHelmet.glb")
 message(STATUS "Model asset   : ${ASSET_PATH}")
 
 # HDR environment map for image-based lighting (CC0, Poly Haven). Not committed.
+set(ENV_HDR_NAME "shanghai_bund_2k.hdr")
 FetchContent_Declare(envhdr
-  URL https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/brown_photostudio_02_2k.hdr
+  URL https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/${ENV_HDR_NAME}
   DOWNLOAD_NO_EXTRACT TRUE)
 FetchContent_MakeAvailable(envhdr)
-set(ENV_HDR_PATH "${envhdr_SOURCE_DIR}/brown_photostudio_02_2k.hdr")
+set(ENV_HDR_PATH "${envhdr_SOURCE_DIR}/${ENV_HDR_NAME}")
 message(STATUS "Env HDR asset : ${ENV_HDR_PATH}")
 
 add_library(vma INTERFACE)
