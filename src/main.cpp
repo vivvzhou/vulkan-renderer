@@ -6,6 +6,7 @@
 
 #include "core/Window.hpp"
 #include "render/Renderer.hpp"
+#include "vk/Allocator.hpp"
 #include "vk/Device.hpp"
 #include "vk/Instance.hpp"
 #include "vk/Surface.hpp"
@@ -32,6 +33,7 @@ int main() {
         Instance instance(kEnableValidation);
         Surface surface(instance.handle(), window);
         Device device(instance.handle(), surface.handle(), instance.validationEnabled());
+        Allocator allocator(instance.handle(), device.physical(), device.handle());
 
         int fbWidth = 0;
         int fbHeight = 0;
@@ -39,7 +41,7 @@ int main() {
         Swapchain swapchain(device, surface.handle(), static_cast<uint32_t>(fbWidth),
                             static_cast<uint32_t>(fbHeight));
 
-        Renderer renderer(window, device, swapchain);
+        Renderer renderer(window, device, allocator, swapchain);
         renderer.run();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fatal: %s\n", e.what());

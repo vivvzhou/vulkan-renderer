@@ -85,6 +85,10 @@ add_executable(vkrenderer
   src/vk/Instance.cpp
   src/vk/Device.cpp
   src/vk/Swapchain.cpp
+  src/vk/Allocator.cpp
+  src/vk/Buffer.cpp
+  src/vk/Image.cpp
+  src/vk/VmaImpl.cpp
   src/render/Renderer.cpp)
 
 target_include_directories(vkrenderer PRIVATE src)
@@ -114,4 +118,4 @@ else()
 endif()
 
 target_compile_shaders(vkrenderer
-  SHADERS shaders/triangle.vert shaders/triangle.frag)
+  SHADERS shaders/mesh.vert shaders/mesh.frag)
