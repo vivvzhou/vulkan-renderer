@@ -80,7 +80,14 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
 # Application
 # ---------------------------------------------------------------------------
 add_executable(vkrenderer
-  src/main.cpp)
+  src/main.cpp
+  src/core/Window.cpp
+  src/vk/Instance.cpp
+  src/vk/Device.cpp
+  src/vk/Swapchain.cpp
+  src/render/Renderer.cpp)
+
+target_include_directories(vkrenderer PRIVATE src)
 
 target_link_libraries(vkrenderer PRIVATE
   Vulkan::Vulkan
@@ -93,7 +100,8 @@ target_link_libraries(vkrenderer PRIVATE
 target_compile_definitions(vkrenderer PRIVATE
   GLM_FORCE_RADIANS
   GLM_FORCE_DEPTH_ZERO_TO_ONE
-  GLFW_INCLUDE_VULKAN)
+  GLFW_INCLUDE_VULKAN
+  SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
 
 if(WIN32)
   target_compile_definitions(vkrenderer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -105,6 +113,5 @@ else()
   target_compile_options(vkrenderer PRIVATE -Wall -Wextra)
 endif()
 
-# Phase 1 will enable:
-# target_compile_shaders(vkrenderer
-#   SHADERS shaders/triangle.vert shaders/triangle.frag)
+target_compile_shaders(vkrenderer
+  SHADERS shaders/triangle.vert shaders/triangle.frag)

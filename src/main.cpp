@@ -1,73 +1,49 @@
-// Phase 0 smoke test: create a VkInstance, report the loader's API version, and
-// enumerate physical devices. On this machine that should list the NVIDIA RTX 4050
-// (discrete) and the Intel Arc (integrated) GPU -- confirming the loader, the SDK,
-// and the CMake/MSVC toolchain are all wired up before any real rendering begins.
+// Phase 1: window + swapchain + a first triangle.
+//
+// Wires together the RAII Vulkan objects in the correct construction/destruction order
+// (surface after instance, device after surface, everything torn down in reverse) and hands
+// them to the Renderer, which owns the render pass, pipeline, and the main draw loop.
 
-#include <vulkan/vulkan.h>
+#include "core/Window.hpp"
+#include "render/Renderer.hpp"
+#include "vk/Device.hpp"
+#include "vk/Instance.hpp"
+#include "vk/Surface.hpp"
+#include "vk/Swapchain.hpp"
 
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
+#include <exception>
 
-static const char* device_type_name(VkPhysicalDeviceType type) {
-    switch (type) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return "Discrete";
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "Integrated";
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    return "Virtual";
-        case VK_PHYSICAL_DEVICE_TYPE_CPU:            return "CPU";
-        default:                                     return "Other";
-    }
-}
+namespace {
+constexpr int kWidth = 1280;
+constexpr int kHeight = 720;
+
+#ifdef NDEBUG
+constexpr bool kEnableValidation = false;
+#else
+constexpr bool kEnableValidation = true;
+#endif
+} // namespace
 
 int main() {
-    uint32_t loaderVersion = 0;
-    if (vkEnumerateInstanceVersion(&loaderVersion) != VK_SUCCESS) {
-        std::fprintf(stderr, "vkEnumerateInstanceVersion failed\n");
+    try {
+        Window window(kWidth, kHeight, "vulkan-renderer");
+        Instance instance(kEnableValidation);
+        Surface surface(instance.handle(), window);
+        Device device(instance.handle(), surface.handle(), instance.validationEnabled());
+
+        int fbWidth = 0;
+        int fbHeight = 0;
+        window.framebufferSize(fbWidth, fbHeight);
+        Swapchain swapchain(device, surface.handle(), static_cast<uint32_t>(fbWidth),
+                            static_cast<uint32_t>(fbHeight));
+
+        Renderer renderer(window, device, swapchain);
+        renderer.run();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "fatal: %s\n", e.what());
         return EXIT_FAILURE;
     }
-    std::printf("Vulkan loader instance version: %u.%u.%u\n",
-                VK_API_VERSION_MAJOR(loaderVersion),
-                VK_API_VERSION_MINOR(loaderVersion),
-                VK_API_VERSION_PATCH(loaderVersion));
-
-    VkApplicationInfo appInfo{};
-    appInfo.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName   = "vulkan-renderer";
-    appInfo.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
-    appInfo.pEngineName        = "vkrenderer";
-    appInfo.engineVersion      = VK_MAKE_API_VERSION(0, 0, 1, 0);
-    appInfo.apiVersion         = VK_API_VERSION_1_3;
-
-    VkInstanceCreateInfo createInfo{};
-    createInfo.sType            = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    createInfo.pApplicationInfo = &appInfo;
-
-    VkInstance instance = VK_NULL_HANDLE;
-    if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
-        std::fprintf(stderr, "vkCreateInstance failed\n");
-        return EXIT_FAILURE;
-    }
-    std::printf("VkInstance created.\n");
-
-    uint32_t deviceCount = 0;
-    vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
-    std::vector<VkPhysicalDevice> devices(deviceCount);
-    vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
-
-    std::printf("Physical devices (%u):\n", deviceCount);
-    for (VkPhysicalDevice dev : devices) {
-        VkPhysicalDeviceProperties props{};
-        vkGetPhysicalDeviceProperties(dev, &props);
-        std::printf("  - %-40s [%s] API %u.%u.%u\n",
-                    props.deviceName,
-                    device_type_name(props.deviceType),
-                    VK_API_VERSION_MAJOR(props.apiVersion),
-                    VK_API_VERSION_MINOR(props.apiVersion),
-                    VK_API_VERSION_PATCH(props.apiVersion));
-    }
-
-    vkDestroyInstance(instance, nullptr);
-    std::printf("OK\n");
     return EXIT_SUCCESS;
 }

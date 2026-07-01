@@ -12,8 +12,8 @@ ambient-occlusion compute pass.
 
 Built incrementally in phases — each one a runnable milestone:
 
-- [ ] **Phase 0** — toolchain, CMake skeleton, `VkInstance` smoke test
-- [ ] **Phase 1** — swapchain + first triangle
+- [x] **Phase 0** — toolchain, CMake skeleton, `VkInstance` smoke test
+- [x] **Phase 1** — swapchain + first triangle
 - [ ] **Phase 2** — VMA, buffers, depth, camera, textured glTF mesh
 - [ ] **Phase 3** — PBR (GGX) + image-based lighting
 - [ ] **Phase 4** — shadow mapping
