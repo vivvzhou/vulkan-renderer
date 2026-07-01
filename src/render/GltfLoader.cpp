@@ -78,7 +78,15 @@ void appendPrimitive(const tinygltf::Model& model, const tinygltf::Primitive& pr
         uvStride = acc.ByteStride(model.bufferViews[acc.bufferView]);
     }
 
-    // Normals are transformed by the upper-left 3x3 (fine for the rotations/uniform scale here).
+    const unsigned char* tanData = nullptr;
+    size_t tanStride = 0;
+    if (prim.attributes.count("TANGENT")) {
+        const tinygltf::Accessor& acc = model.accessors[prim.attributes.at("TANGENT")];
+        tanData = accessorPtr(model, acc);
+        tanStride = acc.ByteStride(model.bufferViews[acc.bufferView]);
+    }
+
+    // Normals/tangents are transformed by the upper-left 3x3 (fine for rotations/uniform scale).
     const glm::mat3 normalMatrix(world);
     const auto base = static_cast<uint32_t>(out.vertices.size());
 
@@ -98,6 +106,13 @@ void appendPrimitive(const tinygltf::Model& model, const tinygltf::Primitive& pr
         if (uvData) {
             const auto* uv = reinterpret_cast<const float*>(uvData + i * uvStride);
             v.uv = glm::vec2(uv[0], uv[1]);
+        }
+
+        if (tanData) {
+            const auto* t = reinterpret_cast<const float*>(tanData + i * tanStride);
+            v.tangent = glm::vec4(normalMatrix * glm::vec3(t[0], t[1], t[2]), t[3]);
+        } else {
+            v.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f); // no normal-map basis available
         }
         out.vertices.push_back(v);
     }
@@ -139,42 +154,75 @@ void traverseNode(const tinygltf::Model& model, int nodeIndex, const glm::mat4& 
     }
 }
 
-// Pull the base-color image out of the first primitive that has one, expanding to RGBA8.
-void loadBaseColorTexture(const tinygltf::Model& model, MeshData& out) {
-    int imageIndex = -1;
-    for (const tinygltf::Material& mat : model.materials) {
-        const int texIndex = mat.pbrMetallicRoughness.baseColorTexture.index;
-        if (texIndex >= 0 && model.textures[texIndex].source >= 0) {
-            imageIndex = model.textures[texIndex].source;
-            break;
-        }
+// A 1x1 RGBA fallback texture.
+TextureData solidTexture(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    TextureData tex;
+    tex.pixels = {r, g, b, a};
+    tex.width = 1;
+    tex.height = 1;
+    return tex;
+}
+
+// Decode the glTF texture at textureIndex into RGBA8, or return the given fallback if it is
+// absent. tinygltf has already decoded the image bytes; we just widen RGB -> RGBA here.
+TextureData loadTexture(const tinygltf::Model& model, int textureIndex,
+                        const TextureData& fallback) {
+    if (textureIndex < 0 || model.textures[textureIndex].source < 0) {
+        return fallback;
+    }
+    const tinygltf::Image& image = model.images[model.textures[textureIndex].source];
+    if (image.width <= 0 || image.height <= 0) {
+        return fallback;
     }
 
-    if (imageIndex < 0) {
-        // Fallback: a single white texel so untextured meshes still render lit.
-        out.texturePixels = {255, 255, 255, 255};
-        out.textureWidth = 1;
-        out.textureHeight = 1;
-        return;
-    }
-
-    const tinygltf::Image& image = model.images[imageIndex];
-    out.textureWidth = static_cast<uint32_t>(image.width);
-    out.textureHeight = static_cast<uint32_t>(image.height);
-    out.texturePixels.resize(static_cast<size_t>(image.width) * image.height * 4);
+    TextureData tex;
+    tex.width = static_cast<uint32_t>(image.width);
+    tex.height = static_cast<uint32_t>(image.height);
+    tex.pixels.resize(static_cast<size_t>(image.width) * image.height * 4);
 
     if (image.component == 4) {
-        std::memcpy(out.texturePixels.data(), image.image.data(), out.texturePixels.size());
+        std::memcpy(tex.pixels.data(), image.image.data(), tex.pixels.size());
     } else if (image.component == 3) {
         for (size_t i = 0; i < static_cast<size_t>(image.width) * image.height; ++i) {
-            out.texturePixels[i * 4 + 0] = image.image[i * 3 + 0];
-            out.texturePixels[i * 4 + 1] = image.image[i * 3 + 1];
-            out.texturePixels[i * 4 + 2] = image.image[i * 3 + 2];
-            out.texturePixels[i * 4 + 3] = 255;
+            tex.pixels[i * 4 + 0] = image.image[i * 3 + 0];
+            tex.pixels[i * 4 + 1] = image.image[i * 3 + 1];
+            tex.pixels[i * 4 + 2] = image.image[i * 3 + 2];
+            tex.pixels[i * 4 + 3] = 255;
         }
     } else {
         throw std::runtime_error("unsupported glTF image component count");
     }
+    return tex;
+}
+
+// Load the full metallic-roughness material (five maps + factors) from the first material.
+void loadMaterial(const tinygltf::Model& model, MeshData& out) {
+    // Neutral fallbacks: white base/MR/AO, black emissive, flat (+Z) tangent-space normal.
+    out.baseColor = solidTexture(255, 255, 255, 255);
+    out.metallicRoughness = solidTexture(255, 255, 255, 255);
+    out.normal = solidTexture(128, 128, 255, 255);
+    out.emissive = solidTexture(0, 0, 0, 255);
+    out.occlusion = solidTexture(255, 255, 255, 255);
+
+    if (model.materials.empty()) {
+        return;
+    }
+    const tinygltf::Material& mat = model.materials[0];
+    const auto& pbr = mat.pbrMetallicRoughness;
+
+    out.baseColor = loadTexture(model, pbr.baseColorTexture.index, out.baseColor);
+    out.metallicRoughness =
+        loadTexture(model, pbr.metallicRoughnessTexture.index, out.metallicRoughness);
+    out.normal = loadTexture(model, mat.normalTexture.index, out.normal);
+    out.emissive = loadTexture(model, mat.emissiveTexture.index, out.emissive);
+    out.occlusion = loadTexture(model, mat.occlusionTexture.index, out.occlusion);
+
+    out.baseColorFactor = glm::vec4(pbr.baseColorFactor[0], pbr.baseColorFactor[1],
+                                    pbr.baseColorFactor[2], pbr.baseColorFactor[3]);
+    out.metallicFactor = static_cast<float>(pbr.metallicFactor);
+    out.roughnessFactor = static_cast<float>(pbr.roughnessFactor);
+    out.emissiveFactor =
+        glm::vec3(mat.emissiveFactor[0], mat.emissiveFactor[1], mat.emissiveFactor[2]);
 }
 
 void computeBounds(MeshData& out) {
@@ -221,7 +269,7 @@ MeshData loadGltf(const std::string& path) {
         throw std::runtime_error("glTF '" + path + "' contained no geometry");
     }
 
-    loadBaseColorTexture(model, out);
+    loadMaterial(model, out);
     computeBounds(out);
     return out;
 }

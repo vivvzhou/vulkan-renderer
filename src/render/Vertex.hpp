@@ -13,6 +13,7 @@ struct Vertex {
     glm::vec3 pos;
     glm::vec3 normal;
     glm::vec2 uv;
+    glm::vec4 tangent; // xyz = tangent, w = handedness sign (glTF convention)
 
     static VkVertexInputBindingDescription bindingDescription() {
         VkVertexInputBindingDescription binding{};
@@ -22,8 +23,8 @@ struct Vertex {
         return binding;
     }
 
-    static std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions() {
-        std::array<VkVertexInputAttributeDescription, 3> attrs{};
+    static std::array<VkVertexInputAttributeDescription, 4> attributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 4> attrs{};
         attrs[0].location = 0; // layout(location = 0) in vec3 inPos
         attrs[0].binding = 0;
         attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
@@ -38,6 +39,11 @@ struct Vertex {
         attrs[2].binding = 0;
         attrs[2].format = VK_FORMAT_R32G32_SFLOAT;
         attrs[2].offset = offsetof(Vertex, uv);
+
+        attrs[3].location = 3; // layout(location = 3) in vec4 inTangent
+        attrs[3].binding = 0;
+        attrs[3].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attrs[3].offset = offsetof(Vertex, tangent);
         return attrs;
     }
 };

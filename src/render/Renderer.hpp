@@ -7,6 +7,7 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -16,6 +17,7 @@ class Device;
 class Swapchain;
 class Allocator;
 struct MeshData;
+struct TextureData;
 
 // Owns the render pass, graphics pipeline, framebuffers, depth buffer, per-frame uniform
 // buffers + descriptor sets, the mesh (vertex/index buffers), a texture, and per-frame sync
@@ -37,7 +39,7 @@ private:
     void createDepthResources();
     void createFramebuffers();
     void createCommandResources();
-    void createTexture(const MeshData& model);
+    void createTextures(const MeshData& model);
     void createMesh(const MeshData& model);
     void createUniformBuffers();
     void createDescriptorPool();
@@ -56,6 +58,7 @@ private:
     // Used for staging uploads (buffer copies, image layout transitions).
     void immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
     Buffer createDeviceLocalBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage);
+    Image uploadTexture(const TextureData& tex, VkFormat format);
 
     static constexpr int kFramesInFlight = 2;
 
@@ -77,12 +80,24 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_; // one per frame in flight
 
-    // Mesh + texture.
+    // Mesh + PBR material.
     Buffer vertexBuffer_;
     Buffer indexBuffer_;
     uint32_t indexCount_ = 0;
-    Image texture_;
+
+    // Five material maps, in binding order: base color, metallic-roughness, normal, emissive,
+    // occlusion (see kTextureCount). One sampler is shared across all of them.
+    static constexpr int kTextureCount = 5;
+    std::array<Image, kTextureCount> textures_;
     VkSampler sampler_ = VK_NULL_HANDLE;
+
+    // Material factors pushed as push constants; layout matches the shader's Material block.
+    struct MaterialPush {
+        glm::vec4 baseColorFactor{1.0f};
+        glm::vec4 emissiveFactor{0.0f};
+        float metallicFactor = 1.0f;
+        float roughnessFactor = 1.0f;
+    } material_;
 
     // Used to auto-fit the loaded mesh (any authored scale) into view.
     glm::vec3 modelCenter_{0.0f};

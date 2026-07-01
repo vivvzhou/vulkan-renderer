@@ -27,12 +27,16 @@
 
 namespace {
 
-// Matches the CameraUBO block in mesh.vert. Three mat4s are naturally std140-compatible.
+// Matches the CameraUBO block in the shaders. Three mat4s + a vec4 are std140-compatible.
 struct CameraUBO {
     glm::mat4 model;
     glm::mat4 view;
     glm::mat4 proj;
+    glm::vec4 camPos; // world-space eye position (xyz)
 };
+
+// Fixed eye position; also fed to the fragment shader for the view vector.
+constexpr glm::vec3 kEye = glm::vec3(2.0f, 1.5f, 2.5f);
 
 std::vector<char> readFile(const std::string& path) {
     std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -53,6 +57,10 @@ Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapcha
     const MeshData model = loadGltf(ASSET_PATH);
     modelCenter_ = model.center;
     modelRadius_ = model.radius;
+    material_.baseColorFactor = model.baseColorFactor;
+    material_.emissiveFactor = glm::vec4(model.emissiveFactor, 0.0f);
+    material_.metallicFactor = model.metallicFactor;
+    material_.roughnessFactor = model.roughnessFactor;
 
     depthFormat_ = findDepthFormat();
     createRenderPass();
@@ -61,7 +69,7 @@ Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapcha
     createDepthResources();
     createFramebuffers();
     createCommandResources();
-    createTexture(model);
+    createTextures(model);
     createMesh(model);
     createUniformBuffers();
     createDescriptorPool();
@@ -198,19 +206,20 @@ void Renderer::createRenderPass() {
 }
 
 void Renderer::createDescriptorSetLayout() {
-    VkDescriptorSetLayoutBinding uboBinding{};
-    uboBinding.binding = 0;
-    uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    uboBinding.descriptorCount = 1;
-    uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    // Binding 0: camera UBO (vertex builds clip pos, fragment needs the eye for the view vector).
+    // Bindings 1..5: the five material maps.
+    std::array<VkDescriptorSetLayoutBinding, 1 + kTextureCount> bindings{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    VkDescriptorSetLayoutBinding samplerBinding{};
-    samplerBinding.binding = 1;
-    samplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    samplerBinding.descriptorCount = 1;
-    samplerBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-    const std::array<VkDescriptorSetLayoutBinding, 2> bindings = {uboBinding, samplerBinding};
+    for (int i = 0; i < kTextureCount; ++i) {
+        bindings[i + 1].binding = static_cast<uint32_t>(i + 1);
+        bindings[i + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i + 1].descriptorCount = 1;
+        bindings[i + 1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
 
     VkDescriptorSetLayoutCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -293,10 +302,17 @@ void Renderer::createPipeline() {
     colorBlend.attachmentCount = 1;
     colorBlend.pAttachments = &blendAttachment;
 
+    VkPushConstantRange materialRange{};
+    materialRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    materialRange.offset = 0;
+    materialRange.size = sizeof(MaterialPush);
+
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layoutInfo.setLayoutCount = 1;
     layoutInfo.pSetLayouts = &descriptorSetLayout_;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &materialRange;
     VK_CHECK(vkCreatePipelineLayout(device_.handle(), &layoutInfo, nullptr, &pipelineLayout_));
 
     VkGraphicsPipelineCreateInfo ci{};
@@ -421,23 +437,18 @@ Buffer Renderer::createDeviceLocalBuffer(const void* data, VkDeviceSize size,
     return result;
 }
 
-void Renderer::createTexture(const MeshData& model) {
-    // Upload the glTF base-color image. Stored as sRGB so the sampler linearizes it before it
-    // reaches the shader (base color is authored in sRGB space).
-    const uint32_t width = model.textureWidth;
-    const uint32_t height = model.textureHeight;
-    const VkDeviceSize imageBytes = model.texturePixels.size();
+Image Renderer::uploadTexture(const TextureData& tex, VkFormat format) {
+    const VkDeviceSize imageBytes = tex.pixels.size();
 
     Buffer staging(allocator_.handle(), imageBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                    VMA_MEMORY_USAGE_AUTO,
                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                        VMA_ALLOCATION_CREATE_MAPPED_BIT);
-    std::memcpy(staging.mapped(), model.texturePixels.data(), static_cast<size_t>(imageBytes));
+    std::memcpy(staging.mapped(), tex.pixels.data(), static_cast<size_t>(imageBytes));
 
-    texture_ = Image(allocator_.handle(), device_.handle(), width, height,
-                     VK_FORMAT_R8G8B8A8_SRGB,
-                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                     VK_IMAGE_ASPECT_COLOR_BIT);
+    Image image(allocator_.handle(), device_.handle(), tex.width, tex.height, format,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
 
     immediateSubmit([&](VkCommandBuffer cmd) {
         // 1) UNDEFINED -> TRANSFER_DST_OPTIMAL so we can copy into it.
@@ -447,7 +458,7 @@ void Renderer::createTexture(const MeshData& model) {
         toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toDst.image = texture_.handle();
+        toDst.image = image.handle();
         toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         toDst.srcAccessMask = 0;
         toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -458,8 +469,8 @@ void Renderer::createTexture(const MeshData& model) {
         VkBufferImageCopy copy{};
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.layerCount = 1;
-        copy.imageExtent = {width, height, 1};
-        vkCmdCopyBufferToImage(cmd, staging.handle(), texture_.handle(),
+        copy.imageExtent = {tex.width, tex.height, 1};
+        vkCmdCopyBufferToImage(cmd, staging.handle(), image.handle(),
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
         // 2) TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL for sampling in the frag shader.
@@ -473,9 +484,23 @@ void Renderer::createTexture(const MeshData& model) {
                              &toRead);
     });
 
+    return image;
+}
+
+void Renderer::createTextures(const MeshData& model) {
+    // Color/emissive maps are authored in sRGB (hardware linearizes on sample); the data maps
+    // (metallic-roughness, normal, occlusion) are raw linear values, so use UNORM formats.
+    constexpr VkFormat kSrgb = VK_FORMAT_R8G8B8A8_SRGB;
+    constexpr VkFormat kUnorm = VK_FORMAT_R8G8B8A8_UNORM;
+    textures_[0] = uploadTexture(model.baseColor, kSrgb);
+    textures_[1] = uploadTexture(model.metallicRoughness, kUnorm);
+    textures_[2] = uploadTexture(model.normal, kUnorm);
+    textures_[3] = uploadTexture(model.emissive, kSrgb);
+    textures_[4] = uploadTexture(model.occlusion, kUnorm);
+
     VkSamplerCreateInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    si.magFilter = VK_FILTER_LINEAR; // smooth bilinear filtering for the photo texture
+    si.magFilter = VK_FILTER_LINEAR;
     si.minFilter = VK_FILTER_LINEAR;
     si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -515,7 +540,7 @@ void Renderer::createDescriptorPool() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = kFramesInFlight;
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = kFramesInFlight;
+    sizes[1].descriptorCount = kFramesInFlight * kTextureCount; // five maps per set
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -543,12 +568,14 @@ void Renderer::createDescriptorSets() {
         bufferInfo.offset = 0;
         bufferInfo.range = sizeof(CameraUBO);
 
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.imageView = texture_.view();
-        imageInfo.sampler = sampler_;
+        std::array<VkDescriptorImageInfo, kTextureCount> imageInfos{};
+        for (int t = 0; t < kTextureCount; ++t) {
+            imageInfos[t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos[t].imageView = textures_[t].view();
+            imageInfos[t].sampler = sampler_;
+        }
 
-        std::array<VkWriteDescriptorSet, 2> writes{};
+        std::array<VkWriteDescriptorSet, 1 + kTextureCount> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = descriptorSets_[i];
         writes[0].dstBinding = 0;
@@ -556,12 +583,14 @@ void Renderer::createDescriptorSets() {
         writes[0].descriptorCount = 1;
         writes[0].pBufferInfo = &bufferInfo;
 
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = descriptorSets_[i];
-        writes[1].dstBinding = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].descriptorCount = 1;
-        writes[1].pImageInfo = &imageInfo;
+        for (int t = 0; t < kTextureCount; ++t) {
+            writes[t + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[t + 1].dstSet = descriptorSets_[i];
+            writes[t + 1].dstBinding = static_cast<uint32_t>(t + 1);
+            writes[t + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[t + 1].descriptorCount = 1;
+            writes[t + 1].pImageInfo = &imageInfos[t];
+        }
 
         vkUpdateDescriptorSets(device_.handle(), static_cast<uint32_t>(writes.size()),
                                writes.data(), 0, nullptr);
@@ -629,6 +658,9 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
                             &descriptorSets_[currentFrame_], 0, nullptr);
 
+    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(MaterialPush), &material_);
+
     const VkBuffer vertexBuffers[] = {vertexBuffer_.handle()};
     const VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
@@ -658,9 +690,10 @@ void Renderer::updateUniformBuffer(uint32_t frame) {
 
     CameraUBO ubo{};
     ubo.model = model;
-    ubo.view = glm::lookAt(glm::vec3(2.0f, 1.5f, 2.5f), glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    ubo.view = glm::lookAt(kEye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
     ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
     ubo.proj[1][1] *= -1.0f; // GLM targets OpenGL's flipped-Y clip space; undo it for Vulkan
+    ubo.camPos = glm::vec4(kEye, 1.0f);
 
     std::memcpy(uniformBuffers_[frame].mapped(), &ubo, sizeof(ubo));
 }
