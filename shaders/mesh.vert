@@ -5,7 +5,8 @@ layout(binding = 0) uniform CameraUBO {
     mat4 model;
     mat4 view;
     mat4 proj;
-    vec4 camPos; // world-space eye position (xyz)
+    vec4 camPos;    // world-space eye position (xyz)
+    vec4 iblParams; // x = prefilter max LOD
 } cam;
 
 layout(location = 0) in vec3 inPos;

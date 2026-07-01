@@ -2,6 +2,7 @@
 
 #include "core/Window.hpp"
 #include "render/GltfLoader.hpp"
+#include "render/Ibl.hpp"
 #include "render/Vertex.hpp"
 #include "vk/Allocator.hpp"
 #include "vk/Common.hpp"
@@ -24,15 +25,19 @@
 #ifndef ASSET_PATH
 #define ASSET_PATH "DamagedHelmet.glb"
 #endif
+#ifndef ENV_HDR_PATH
+#define ENV_HDR_PATH "environment.hdr"
+#endif
 
 namespace {
 
-// Matches the CameraUBO block in the shaders. Three mat4s + a vec4 are std140-compatible.
+// Matches the CameraUBO block in the shaders (std140-compatible).
 struct CameraUBO {
     glm::mat4 model;
     glm::mat4 view;
     glm::mat4 proj;
-    glm::vec4 camPos; // world-space eye position (xyz)
+    glm::vec4 camPos;    // world-space eye position (xyz)
+    glm::vec4 iblParams; // x = prefilter max LOD
 };
 
 // Fixed eye position; also fed to the fragment shader for the view vector.
@@ -69,11 +74,14 @@ Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapcha
     createDepthResources();
     createFramebuffers();
     createCommandResources();
+    createIbl();
     createTextures(model);
     createMesh(model);
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
+    createSkyboxPipeline();
+    createSkyboxDescriptors();
     createSyncObjects();
 }
 
@@ -89,6 +97,18 @@ Renderer::~Renderer() {
     }
     for (VkFence f : inFlight_) {
         vkDestroyFence(dev, f, nullptr);
+    }
+    if (skyboxDescriptorPool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(dev, skyboxDescriptorPool_, nullptr);
+    }
+    if (skyboxPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, skyboxPipeline_, nullptr);
+    }
+    if (skyboxPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, skyboxPipelineLayout_, nullptr);
+    }
+    if (skyboxSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, skyboxSetLayout_, nullptr);
     }
     if (descriptorPool_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(dev, descriptorPool_, nullptr);
@@ -207,14 +227,15 @@ void Renderer::createRenderPass() {
 
 void Renderer::createDescriptorSetLayout() {
     // Binding 0: camera UBO (vertex builds clip pos, fragment needs the eye for the view vector).
-    // Bindings 1..5: the five material maps.
-    std::array<VkDescriptorSetLayoutBinding, 1 + kTextureCount> bindings{};
+    // Bindings 1..5: the five material maps. Bindings 6..8: the IBL maps.
+    constexpr int kImageBindings = kTextureCount + kIblTextureCount;
+    std::array<VkDescriptorSetLayoutBinding, 1 + kImageBindings> bindings{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
     bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    for (int i = 0; i < kTextureCount; ++i) {
+    for (int i = 0; i < kImageBindings; ++i) {
         bindings[i + 1].binding = static_cast<uint32_t>(i + 1);
         bindings[i + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[i + 1].descriptorCount = 1;
@@ -383,6 +404,12 @@ void Renderer::createCommandResources() {
     VK_CHECK(vkAllocateCommandBuffers(device_.handle(), &allocInfo, commandBuffers_.data()));
 }
 
+void Renderer::createIbl() {
+    // Precompute irradiance / prefilter / BRDF LUT from the HDR environment (uses commandPool_).
+    ibl_ = std::make_unique<Ibl>(device_.handle(), allocator_.handle(), device_.graphicsQueue(),
+                                 commandPool_, ENV_HDR_PATH);
+}
+
 void Renderer::immediateSubmit(const std::function<void(VkCommandBuffer)>& record) {
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -540,7 +567,8 @@ void Renderer::createDescriptorPool() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = kFramesInFlight;
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = kFramesInFlight * kTextureCount; // five maps per set
+    sizes[1].descriptorCount =
+        kFramesInFlight * (kTextureCount + kIblTextureCount); // material + IBL maps per set
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -568,14 +596,22 @@ void Renderer::createDescriptorSets() {
         bufferInfo.offset = 0;
         bufferInfo.range = sizeof(CameraUBO);
 
-        std::array<VkDescriptorImageInfo, kTextureCount> imageInfos{};
+        constexpr int kImageBindings = kTextureCount + kIblTextureCount;
+        std::array<VkDescriptorImageInfo, kImageBindings> imageInfos{};
         for (int t = 0; t < kTextureCount; ++t) {
             imageInfos[t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             imageInfos[t].imageView = textures_[t].view();
             imageInfos[t].sampler = sampler_;
         }
+        // Bindings 6, 7, 8: irradiance, prefilter (env sampler), BRDF LUT (clamp sampler).
+        imageInfos[5] = {ibl_->environmentSampler(), ibl_->irradianceView(),
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        imageInfos[6] = {ibl_->environmentSampler(), ibl_->prefilterView(),
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        imageInfos[7] = {ibl_->lutSampler(), ibl_->brdfLutView(),
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
-        std::array<VkWriteDescriptorSet, 1 + kTextureCount> writes{};
+        std::array<VkWriteDescriptorSet, 1 + kImageBindings> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = descriptorSets_[i];
         writes[0].dstBinding = 0;
@@ -583,7 +619,7 @@ void Renderer::createDescriptorSets() {
         writes[0].descriptorCount = 1;
         writes[0].pBufferInfo = &bufferInfo;
 
-        for (int t = 0; t < kTextureCount; ++t) {
+        for (int t = 0; t < kImageBindings; ++t) {
             writes[t + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[t + 1].dstSet = descriptorSets_[i];
             writes[t + 1].dstBinding = static_cast<uint32_t>(t + 1);
@@ -592,6 +628,166 @@ void Renderer::createDescriptorSets() {
             writes[t + 1].pImageInfo = &imageInfos[t];
         }
 
+        vkUpdateDescriptorSets(device_.handle(), static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+    }
+}
+
+void Renderer::createSkyboxPipeline() {
+    // Set 0: camera UBO (binding 0) + environment map (binding 1).
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo slci{};
+    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    slci.bindingCount = static_cast<uint32_t>(bindings.size());
+    slci.pBindings = bindings.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(device_.handle(), &slci, nullptr, &skyboxSetLayout_));
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &skyboxSetLayout_;
+    VK_CHECK(vkCreatePipelineLayout(device_.handle(), &plci, nullptr, &skyboxPipelineLayout_));
+
+    VkShaderModule vert = loadShaderModule("skybox.vert.spv");
+    VkShaderModule frag = loadShaderModule("skybox.frag.spv");
+
+    VkPipelineShaderStageCreateInfo vertStage{};
+    vertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStage.module = vert;
+    vertStage.pName = "main";
+    VkPipelineShaderStageCreateInfo fragStage{};
+    fragStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragStage.module = frag;
+    fragStage.pName = "main";
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages = {vertStage, fragStage};
+
+    // No vertex input: the skybox is a shader-generated fullscreen triangle.
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    const std::array<VkDynamicState, 2> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                         VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // Draw at the far plane; keep it behind anything already in the depth buffer, don't write depth.
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_FALSE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blendAttachment.blendEnable = VK_FALSE;
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &blendAttachment;
+
+    VkGraphicsPipelineCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    ci.stageCount = static_cast<uint32_t>(stages.size());
+    ci.pStages = stages.data();
+    ci.pVertexInputState = &vertexInput;
+    ci.pInputAssemblyState = &inputAssembly;
+    ci.pViewportState = &viewportState;
+    ci.pRasterizationState = &rasterizer;
+    ci.pMultisampleState = &multisampling;
+    ci.pDepthStencilState = &depthStencil;
+    ci.pColorBlendState = &colorBlend;
+    ci.pDynamicState = &dynamicState;
+    ci.layout = skyboxPipelineLayout_;
+    ci.renderPass = renderPass_;
+    ci.subpass = 0;
+    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE, 1, &ci, nullptr,
+                                       &skyboxPipeline_));
+
+    vkDestroyShaderModule(device_.handle(), frag, nullptr);
+    vkDestroyShaderModule(device_.handle(), vert, nullptr);
+}
+
+void Renderer::createSkyboxDescriptors() {
+    std::array<VkDescriptorPoolSize, 2> sizes{};
+    sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    sizes[0].descriptorCount = kFramesInFlight;
+    sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sizes[1].descriptorCount = kFramesInFlight;
+
+    VkDescriptorPoolCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.poolSizeCount = static_cast<uint32_t>(sizes.size());
+    pci.pPoolSizes = sizes.data();
+    pci.maxSets = kFramesInFlight;
+    VK_CHECK(vkCreateDescriptorPool(device_.handle(), &pci, nullptr, &skyboxDescriptorPool_));
+
+    const std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, skyboxSetLayout_);
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = skyboxDescriptorPool_;
+    allocInfo.descriptorSetCount = kFramesInFlight;
+    allocInfo.pSetLayouts = layouts.data();
+    skyboxDescriptorSets_.resize(kFramesInFlight);
+    VK_CHECK(vkAllocateDescriptorSets(device_.handle(), &allocInfo, skyboxDescriptorSets_.data()));
+
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = uniformBuffers_[i].handle();
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(CameraUBO);
+
+        VkDescriptorImageInfo envInfo{};
+        envInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        envInfo.imageView = ibl_->environmentView();
+        envInfo.sampler = ibl_->environmentSampler();
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = skyboxDescriptorSets_[i];
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorCount = 1;
+        writes[0].pBufferInfo = &bufferInfo;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = skyboxDescriptorSets_[i];
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].descriptorCount = 1;
+        writes[1].pImageInfo = &envInfo;
         vkUpdateDescriptorSets(device_.handle(), static_cast<uint32_t>(writes.size()),
                                writes.data(), 0, nullptr);
     }
@@ -668,6 +864,13 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
 
     vkCmdDrawIndexed(cmd, indexCount_, 1, 0, 0, 0);
 
+    // Skybox last: it fills only the background (depth test LESS_OR_EQUAL vs the cleared far
+    // plane), so it never overdraws the mesh but avoids shading pixels the mesh already covers.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipelineLayout_, 0, 1,
+                            &skyboxDescriptorSets_[currentFrame_], 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
     vkCmdEndRenderPass(cmd);
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
@@ -694,6 +897,7 @@ void Renderer::updateUniformBuffer(uint32_t frame) {
     ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
     ubo.proj[1][1] *= -1.0f; // GLM targets OpenGL's flipped-Y clip space; undo it for Vulkan
     ubo.camPos = glm::vec4(kEye, 1.0f);
+    ubo.iblParams = glm::vec4(ibl_->prefilterMaxLod(), 0.0f, 0.0f, 0.0f);
 
     std::memcpy(uniformBuffers_[frame].mapped(), &ubo, sizeof(ubo));
 }

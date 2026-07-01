@@ -10,12 +10,14 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 class Window;
 class Device;
 class Swapchain;
 class Allocator;
+class Ibl;
 struct MeshData;
 struct TextureData;
 
@@ -39,11 +41,14 @@ private:
     void createDepthResources();
     void createFramebuffers();
     void createCommandResources();
+    void createIbl();
     void createTextures(const MeshData& model);
     void createMesh(const MeshData& model);
     void createUniformBuffers();
     void createDescriptorPool();
     void createDescriptorSets();
+    void createSkyboxPipeline();
+    void createSkyboxDescriptors();
     void createSyncObjects();
 
     void recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
@@ -86,10 +91,21 @@ private:
     uint32_t indexCount_ = 0;
 
     // Five material maps, in binding order: base color, metallic-roughness, normal, emissive,
-    // occlusion (see kTextureCount). One sampler is shared across all of them.
+    // occlusion (see kTextureCount). One sampler is shared across all of them. The three IBL
+    // maps follow at bindings 6, 7, 8.
     static constexpr int kTextureCount = 5;
+    static constexpr int kIblTextureCount = 3;
     std::array<Image, kTextureCount> textures_;
     VkSampler sampler_ = VK_NULL_HANDLE;
+
+    std::unique_ptr<Ibl> ibl_;
+
+    // Skybox: its own pipeline sampling the environment map, reusing the camera UBO.
+    VkDescriptorSetLayout skyboxSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout skyboxPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline skyboxPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool skyboxDescriptorPool_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> skyboxDescriptorSets_;
 
     // Material factors pushed as push constants; layout matches the shader's Material block.
     struct MaterialPush {

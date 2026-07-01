@@ -70,6 +70,14 @@ FetchContent_MakeAvailable(damagedhelmet)
 set(ASSET_PATH "${damagedhelmet_SOURCE_DIR}/DamagedHelmet.glb")
 message(STATUS "Model asset   : ${ASSET_PATH}")
 
+# HDR environment map for image-based lighting (CC0, Poly Haven). Not committed.
+FetchContent_Declare(envhdr
+  URL https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/brown_photostudio_02_2k.hdr
+  DOWNLOAD_NO_EXTRACT TRUE)
+FetchContent_MakeAvailable(envhdr)
+set(ENV_HDR_PATH "${envhdr_SOURCE_DIR}/brown_photostudio_02_2k.hdr")
+message(STATUS "Env HDR asset : ${ENV_HDR_PATH}")
+
 add_library(vma INTERFACE)
 target_include_directories(vma INTERFACE ${vma_SOURCE_DIR}/include)
 
@@ -98,6 +106,7 @@ add_executable(vkrenderer
   src/vk/Image.cpp
   src/vk/VmaImpl.cpp
   src/render/GltfLoader.cpp
+  src/render/Ibl.cpp
   src/render/Renderer.cpp)
 
 target_include_directories(vkrenderer PRIVATE src)
@@ -115,7 +124,8 @@ target_compile_definitions(vkrenderer PRIVATE
   GLM_FORCE_DEPTH_ZERO_TO_ONE
   GLFW_INCLUDE_VULKAN
   SHADER_DIR="${CMAKE_BINARY_DIR}/shaders"
-  ASSET_PATH="${ASSET_PATH}")
+  ASSET_PATH="${ASSET_PATH}"
+  ENV_HDR_PATH="${ENV_HDR_PATH}")
 
 if(WIN32)
   target_compile_definitions(vkrenderer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -128,4 +138,9 @@ else()
 endif()
 
 target_compile_shaders(vkrenderer
-  SHADERS shaders/mesh.vert shaders/mesh.frag)
+  SHADERS
+    shaders/mesh.vert shaders/mesh.frag
+    shaders/skybox.vert shaders/skybox.frag
+    shaders/ibl_irradiance.comp
+    shaders/ibl_prefilter.comp
+    shaders/ibl_brdf.comp)
