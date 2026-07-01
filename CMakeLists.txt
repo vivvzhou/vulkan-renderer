@@ -62,6 +62,14 @@ FetchContent_Declare(tinygltf
 
 FetchContent_MakeAvailable(glfw glm vma stb tinygltf)
 
+# Sample model (single binary asset, downloaded but not extracted). Not committed to the repo.
+FetchContent_Declare(damagedhelmet
+  URL https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb
+  DOWNLOAD_NO_EXTRACT TRUE)
+FetchContent_MakeAvailable(damagedhelmet)
+set(ASSET_PATH "${damagedhelmet_SOURCE_DIR}/DamagedHelmet.glb")
+message(STATUS "Model asset   : ${ASSET_PATH}")
+
 add_library(vma INTERFACE)
 target_include_directories(vma INTERFACE ${vma_SOURCE_DIR}/include)
 
@@ -89,6 +97,7 @@ add_executable(vkrenderer
   src/vk/Buffer.cpp
   src/vk/Image.cpp
   src/vk/VmaImpl.cpp
+  src/render/GltfLoader.cpp
   src/render/Renderer.cpp)
 
 target_include_directories(vkrenderer PRIVATE src)
@@ -105,7 +114,8 @@ target_compile_definitions(vkrenderer PRIVATE
   GLM_FORCE_RADIANS
   GLM_FORCE_DEPTH_ZERO_TO_ONE
   GLFW_INCLUDE_VULKAN
-  SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
+  SHADER_DIR="${CMAKE_BINARY_DIR}/shaders"
+  ASSET_PATH="${ASSET_PATH}")
 
 if(WIN32)
   target_compile_definitions(vkrenderer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

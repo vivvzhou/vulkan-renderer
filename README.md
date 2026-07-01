@@ -14,7 +14,7 @@ Built incrementally in phases — each one a runnable milestone:
 
 - [x] **Phase 0** — toolchain, CMake skeleton, `VkInstance` smoke test
 - [x] **Phase 1** — swapchain + first triangle
-- [ ] **Phase 2** — VMA, buffers, depth, camera, textured glTF mesh
+- [x] **Phase 2** — VMA, buffers, depth, camera, textured glTF mesh
 - [ ] **Phase 3** — PBR (GGX) + image-based lighting
 - [ ] **Phase 4** — shadow mapping
 - [ ] **Phase 5** — deferred G-buffer

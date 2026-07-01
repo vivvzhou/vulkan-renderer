@@ -1,6 +1,7 @@
 #include "render/Renderer.hpp"
 
 #include "core/Window.hpp"
+#include "render/GltfLoader.hpp"
 #include "render/Vertex.hpp"
 #include "vk/Allocator.hpp"
 #include "vk/Common.hpp"
@@ -19,6 +20,9 @@
 
 #ifndef SHADER_DIR
 #define SHADER_DIR "shaders"
+#endif
+#ifndef ASSET_PATH
+#define ASSET_PATH "DamagedHelmet.glb"
 #endif
 
 namespace {
@@ -42,39 +46,14 @@ std::vector<char> readFile(const std::string& path) {
     return buffer;
 }
 
-// A unit cube centered at the origin: 24 vertices (4 per face) so each face gets its own
-// flat normal and a full 0..1 UV square.
-void buildCube(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices) {
-    struct Face {
-        glm::vec3 normal;
-        glm::vec3 origin;   // bottom-left corner of the face
-        glm::vec3 right;    // edge to +U
-        glm::vec3 up;       // edge to +V
-    };
-    const std::array<Face, 6> faces = {{
-        {{0, 0, 1}, {-0.5f, -0.5f, 0.5f}, {1, 0, 0}, {0, 1, 0}},   // +Z front
-        {{0, 0, -1}, {0.5f, -0.5f, -0.5f}, {-1, 0, 0}, {0, 1, 0}}, // -Z back
-        {{1, 0, 0}, {0.5f, -0.5f, 0.5f}, {0, 0, -1}, {0, 1, 0}},   // +X right
-        {{-1, 0, 0}, {-0.5f, -0.5f, -0.5f}, {0, 0, 1}, {0, 1, 0}}, // -X left
-        {{0, 1, 0}, {-0.5f, 0.5f, 0.5f}, {1, 0, 0}, {0, 0, -1}},   // +Y top
-        {{0, -1, 0}, {-0.5f, -0.5f, -0.5f}, {1, 0, 0}, {0, 0, 1}}, // -Y bottom
-    }};
-
-    for (const Face& f : faces) {
-        const auto base = static_cast<uint32_t>(vertices.size());
-        vertices.push_back({f.origin, f.normal, {0.0f, 0.0f}});
-        vertices.push_back({f.origin + f.right, f.normal, {1.0f, 0.0f}});
-        vertices.push_back({f.origin + f.right + f.up, f.normal, {1.0f, 1.0f}});
-        vertices.push_back({f.origin + f.up, f.normal, {0.0f, 1.0f}});
-        indices.insert(indices.end(),
-                       {base, base + 1, base + 2, base + 2, base + 3, base});
-    }
-}
-
 } // namespace
 
 Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapchain& swapchain)
     : window_(window), device_(device), allocator_(allocator), swapchain_(swapchain) {
+    const MeshData model = loadGltf(ASSET_PATH);
+    modelCenter_ = model.center;
+    modelRadius_ = model.radius;
+
     depthFormat_ = findDepthFormat();
     createRenderPass();
     createDescriptorSetLayout();
@@ -82,8 +61,8 @@ Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapcha
     createDepthResources();
     createFramebuffers();
     createCommandResources();
-    createTexture();
-    createMesh();
+    createTexture(model);
+    createMesh(model);
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
@@ -442,27 +421,20 @@ Buffer Renderer::createDeviceLocalBuffer(const void* data, VkDeviceSize size,
     return result;
 }
 
-void Renderer::createTexture() {
-    // Procedural 8x8 checkerboard (upgraded to a glTF base-color texture later). Stored as
-    // sRGB so the sampler linearizes it before it reaches the shader.
-    constexpr uint32_t kSize = 8;
-    constexpr uint32_t kTexels = kSize * kSize;
-    std::array<uint32_t, kTexels> pixels{}; // RGBA8
-    for (uint32_t y = 0; y < kSize; ++y) {
-        for (uint32_t x = 0; x < kSize; ++x) {
-            const bool light = ((x + y) & 1) == 0;
-            pixels[y * kSize + x] = light ? 0xFFFFFFFFu : 0xFF3A3A3Au;
-        }
-    }
-    const VkDeviceSize imageBytes = sizeof(pixels);
+void Renderer::createTexture(const MeshData& model) {
+    // Upload the glTF base-color image. Stored as sRGB so the sampler linearizes it before it
+    // reaches the shader (base color is authored in sRGB space).
+    const uint32_t width = model.textureWidth;
+    const uint32_t height = model.textureHeight;
+    const VkDeviceSize imageBytes = model.texturePixels.size();
 
     Buffer staging(allocator_.handle(), imageBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                    VMA_MEMORY_USAGE_AUTO,
                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                        VMA_ALLOCATION_CREATE_MAPPED_BIT);
-    std::memcpy(staging.mapped(), pixels.data(), static_cast<size_t>(imageBytes));
+    std::memcpy(staging.mapped(), model.texturePixels.data(), static_cast<size_t>(imageBytes));
 
-    texture_ = Image(allocator_.handle(), device_.handle(), kSize, kSize,
+    texture_ = Image(allocator_.handle(), device_.handle(), width, height,
                      VK_FORMAT_R8G8B8A8_SRGB,
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                      VK_IMAGE_ASPECT_COLOR_BIT);
@@ -486,7 +458,7 @@ void Renderer::createTexture() {
         VkBufferImageCopy copy{};
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.layerCount = 1;
-        copy.imageExtent = {kSize, kSize, 1};
+        copy.imageExtent = {width, height, 1};
         vkCmdCopyBufferToImage(cmd, staging.handle(), texture_.handle(),
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
@@ -503,27 +475,26 @@ void Renderer::createTexture() {
 
     VkSamplerCreateInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    si.magFilter = VK_FILTER_NEAREST; // crisp checker squares
-    si.minFilter = VK_FILTER_NEAREST;
+    si.magFilter = VK_FILTER_LINEAR; // smooth bilinear filtering for the photo texture
+    si.minFilter = VK_FILTER_LINEAR;
     si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     si.anisotropyEnable = VK_FALSE; // device feature not enabled yet
     si.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
-    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     VK_CHECK(vkCreateSampler(device_.handle(), &si, nullptr, &sampler_));
 }
 
-void Renderer::createMesh() {
-    std::vector<Vertex> vertices;
-    std::vector<uint32_t> indices;
-    buildCube(vertices, indices);
-    indexCount_ = static_cast<uint32_t>(indices.size());
+void Renderer::createMesh(const MeshData& model) {
+    indexCount_ = static_cast<uint32_t>(model.indices.size());
 
-    vertexBuffer_ = createDeviceLocalBuffer(vertices.data(), sizeof(Vertex) * vertices.size(),
-                                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    indexBuffer_ = createDeviceLocalBuffer(indices.data(), sizeof(uint32_t) * indices.size(),
-                                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    vertexBuffer_ =
+        createDeviceLocalBuffer(model.vertices.data(), sizeof(Vertex) * model.vertices.size(),
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    indexBuffer_ =
+        createDeviceLocalBuffer(model.indices.data(), sizeof(uint32_t) * model.indices.size(),
+                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 }
 
 void Renderer::createUniformBuffers() {
@@ -678,10 +649,17 @@ void Renderer::updateUniformBuffer(uint32_t frame) {
     const float aspect = static_cast<float>(extent.width) /
                          static_cast<float>(extent.height == 0 ? 1 : extent.height);
 
+    // Fit the mesh to a unit sphere at the origin (center it, then scale by 1/radius), spin it
+    // about the up axis, and view it from a fixed 3/4 angle.
+    const float fit = 1.0f / modelRadius_;
+    glm::mat4 model = glm::rotate(glm::mat4(1.0f), t * glm::radians(30.0f), glm::vec3(0, 1, 0));
+    model = glm::scale(model, glm::vec3(fit));
+    model = glm::translate(model, -modelCenter_);
+
     CameraUBO ubo{};
-    ubo.model = glm::rotate(glm::mat4(1.0f), t * glm::radians(45.0f), glm::vec3(0.3f, 1.0f, 0.2f));
+    ubo.model = model;
     ubo.view = glm::lookAt(glm::vec3(2.0f, 1.5f, 2.5f), glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
-    ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);
+    ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
     ubo.proj[1][1] *= -1.0f; // GLM targets OpenGL's flipped-Y clip space; undo it for Vulkan
 
     std::memcpy(uniformBuffers_[frame].mapped(), &ubo, sizeof(ubo));

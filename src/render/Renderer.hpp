@@ -5,6 +5,8 @@
 #include "vk/Buffer.hpp"
 #include "vk/Image.hpp"
 
+#include <glm/glm.hpp>
+
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -13,6 +15,7 @@ class Window;
 class Device;
 class Swapchain;
 class Allocator;
+struct MeshData;
 
 // Owns the render pass, graphics pipeline, framebuffers, depth buffer, per-frame uniform
 // buffers + descriptor sets, the mesh (vertex/index buffers), a texture, and per-frame sync
@@ -34,8 +37,8 @@ private:
     void createDepthResources();
     void createFramebuffers();
     void createCommandResources();
-    void createTexture();
-    void createMesh();
+    void createTexture(const MeshData& model);
+    void createMesh(const MeshData& model);
     void createUniformBuffers();
     void createDescriptorPool();
     void createDescriptorSets();
@@ -80,6 +83,10 @@ private:
     uint32_t indexCount_ = 0;
     Image texture_;
     VkSampler sampler_ = VK_NULL_HANDLE;
+
+    // Used to auto-fit the loaded mesh (any authored scale) into view.
+    glm::vec3 modelCenter_{0.0f};
+    float modelRadius_ = 1.0f;
 
     // Per-frame uniform buffers (persistently mapped host-visible memory) + descriptor sets.
     std::vector<Buffer> uniformBuffers_;
