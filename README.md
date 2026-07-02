@@ -16,7 +16,7 @@ Built incrementally in phases — each one a runnable milestone:
 - [x] **Phase 1** — swapchain + first triangle
 - [x] **Phase 2** — VMA, buffers, depth, camera, textured glTF mesh
 - [x] **Phase 3** — PBR (GGX) + image-based lighting
-- [ ] **Phase 4** — shadow mapping
+- [x] **Phase 4** — shadow mapping
 - [ ] **Phase 5** — deferred G-buffer
 - [ ] **Phase 6** — multithreaded secondary command buffers
 - [ ] **Phase 7** — custom `VkDeviceMemory` allocator

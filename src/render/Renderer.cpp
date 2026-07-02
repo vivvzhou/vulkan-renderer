@@ -33,15 +33,32 @@ namespace {
 
 // Matches the CameraUBO block in the shaders (std140-compatible).
 struct CameraUBO {
-    glm::mat4 model;
     glm::mat4 view;
     glm::mat4 proj;
     glm::vec4 camPos;    // world-space eye position (xyz)
     glm::vec4 iblParams; // x = prefilter max LOD
+    glm::mat4 lightSpace;
+    glm::vec4 lightDir;   // directional light travel direction (xyz)
+    glm::vec4 lightColor; // rgb intensity
+};
+
+// Matches the PushConstants block in mesh.vert/frag.
+struct MeshPush {
+    glm::mat4 model;
+    glm::vec4 baseColorFactor;
+    glm::vec4 emissiveFactor; // w = useTextures flag
+    float metallicFactor;
+    float roughnessFactor;
 };
 
 // Fixed eye position; also fed to the fragment shader for the view vector.
 constexpr glm::vec3 kEye = glm::vec3(2.0f, 1.5f, 2.5f);
+
+// Directional key light: travel direction and radiance. Casts the shadow.
+constexpr glm::vec3 kLightDir = glm::vec3(-0.5f, -1.0f, -0.4f);
+constexpr glm::vec3 kLightColor = glm::vec3(3.0f);
+
+constexpr float kGroundY = -1.2f; // ground plane sits just below the fitted mesh
 
 std::vector<char> readFile(const std::string& path) {
     std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -63,20 +80,29 @@ Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapcha
     modelCenter_ = model.center;
     modelRadius_ = model.radius;
     material_.baseColorFactor = model.baseColorFactor;
-    material_.emissiveFactor = glm::vec4(model.emissiveFactor, 0.0f);
+    material_.emissiveFactor = glm::vec4(model.emissiveFactor, 1.0f); // w = 1: sample textures
     material_.metallicFactor = model.metallicFactor;
     material_.roughnessFactor = model.roughnessFactor;
 
+    // Flat, slightly rough dielectric ground; w = 0 selects the non-textured shading path.
+    groundMaterial_.baseColorFactor = glm::vec4(0.22f, 0.22f, 0.25f, 1.0f);
+    groundMaterial_.emissiveFactor = glm::vec4(0.0f);
+    groundMaterial_.metallicFactor = 0.0f;
+    groundMaterial_.roughnessFactor = 0.85f;
+
     depthFormat_ = findDepthFormat();
     createRenderPass();
+    createShadowResources();
     createDescriptorSetLayout();
     createPipeline();
+    createShadowPipeline();
     createDepthResources();
     createFramebuffers();
     createCommandResources();
     createIbl();
     createTextures(model);
     createMesh(model);
+    createGround();
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
@@ -118,6 +144,23 @@ Renderer::~Renderer() {
     }
     if (commandPool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(dev, commandPool_, nullptr);
+    }
+    if (shadowSampler_ != VK_NULL_HANDLE) {
+        vkDestroySampler(dev, shadowSampler_, nullptr);
+    }
+    for (VkFramebuffer fb : shadowFramebuffers_) {
+        if (fb != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(dev, fb, nullptr);
+        }
+    }
+    if (shadowPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, shadowPipeline_, nullptr);
+    }
+    if (shadowPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, shadowPipelineLayout_, nullptr);
+    }
+    if (shadowRenderPass_ != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(dev, shadowRenderPass_, nullptr);
     }
     for (VkFramebuffer fb : framebuffers_) {
         vkDestroyFramebuffer(dev, fb, nullptr);
@@ -225,10 +268,88 @@ void Renderer::createRenderPass() {
     VK_CHECK(vkCreateRenderPass(device_.handle(), &ci, nullptr, &renderPass_));
 }
 
+void Renderer::createShadowResources() {
+    // Depth-only render pass. finalLayout is READ_ONLY so the main pass can sample it directly.
+    VkAttachmentDescription depth{};
+    depth.format = depthFormat_;
+    depth.samples = VK_SAMPLE_COUNT_1_BIT;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+    VkAttachmentReference depthRef{};
+    depthRef.attachment = 0;
+    depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 0;
+    subpass.pDepthStencilAttachment = &depthRef;
+
+    // Serialize the depth write against the previous frame's sampling and the following main
+    // pass's sampling of this map.
+    std::array<VkSubpassDependency, 2> deps{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    VkRenderPassCreateInfo rpci{};
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &depth;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &subpass;
+    rpci.dependencyCount = static_cast<uint32_t>(deps.size());
+    rpci.pDependencies = deps.data();
+    VK_CHECK(vkCreateRenderPass(device_.handle(), &rpci, nullptr, &shadowRenderPass_));
+
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        shadowMaps_[i] = Image(allocator_.handle(), device_.handle(), kShadowMapSize,
+                               kShadowMapSize, depthFormat_,
+                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                   VK_IMAGE_USAGE_SAMPLED_BIT,
+                               VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        VkImageView view = shadowMaps_[i].view();
+        VkFramebufferCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fci.renderPass = shadowRenderPass_;
+        fci.attachmentCount = 1;
+        fci.pAttachments = &view;
+        fci.width = kShadowMapSize;
+        fci.height = kShadowMapSize;
+        fci.layers = 1;
+        VK_CHECK(vkCreateFramebuffer(device_.handle(), &fci, nullptr, &shadowFramebuffers_[i]));
+    }
+
+    // Nearest sampling with edge clamp; the fragment shader does its own PCF filtering.
+    VkSamplerCreateInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = VK_FILTER_NEAREST;
+    si.minFilter = VK_FILTER_NEAREST;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK_CHECK(vkCreateSampler(device_.handle(), &si, nullptr, &shadowSampler_));
+}
+
 void Renderer::createDescriptorSetLayout() {
     // Binding 0: camera UBO (vertex builds clip pos, fragment needs the eye for the view vector).
-    // Bindings 1..5: the five material maps. Bindings 6..8: the IBL maps.
-    constexpr int kImageBindings = kTextureCount + kIblTextureCount;
+    // Bindings 1..5: material maps. Bindings 6..8: IBL maps. Binding 9: the shadow map.
+    constexpr int kImageBindings = kTextureCount + kIblTextureCount + 1;
     std::array<VkDescriptorSetLayoutBinding, 1 + kImageBindings> bindings{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -323,17 +444,17 @@ void Renderer::createPipeline() {
     colorBlend.attachmentCount = 1;
     colorBlend.pAttachments = &blendAttachment;
 
-    VkPushConstantRange materialRange{};
-    materialRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    materialRange.offset = 0;
-    materialRange.size = sizeof(MaterialPush);
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(MeshPush);
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layoutInfo.setLayoutCount = 1;
     layoutInfo.pSetLayouts = &descriptorSetLayout_;
     layoutInfo.pushConstantRangeCount = 1;
-    layoutInfo.pPushConstantRanges = &materialRange;
+    layoutInfo.pPushConstantRanges = &pushRange;
     VK_CHECK(vkCreatePipelineLayout(device_.handle(), &layoutInfo, nullptr, &pipelineLayout_));
 
     VkGraphicsPipelineCreateInfo ci{};
@@ -356,6 +477,100 @@ void Renderer::createPipeline() {
                                        &pipeline_));
 
     vkDestroyShaderModule(device_.handle(), frag, nullptr);
+    vkDestroyShaderModule(device_.handle(), vert, nullptr);
+}
+
+void Renderer::createShadowPipeline() {
+    // Push constant: lightSpace * model (per object). No descriptor sets needed.
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(glm::mat4);
+
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushRange;
+    VK_CHECK(vkCreatePipelineLayout(device_.handle(), &layoutInfo, nullptr,
+                                    &shadowPipelineLayout_));
+
+    VkShaderModule vert = loadShaderModule("shadow.vert.spv");
+    VkPipelineShaderStageCreateInfo vertStage{};
+    vertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStage.module = vert;
+    vertStage.pName = "main";
+
+    // Only the position attribute is needed for a depth-only pass.
+    const auto binding = Vertex::bindingDescription();
+    const auto attributes = Vertex::attributeDescriptions();
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount = 1;
+    vertexInput.pVertexBindingDescriptions = &binding;
+    vertexInput.vertexAttributeDescriptionCount = 1; // position only
+    vertexInput.pVertexAttributeDescriptions = attributes.data();
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    const std::array<VkDynamicState, 2> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                         VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    // Depth bias combats shadow acne; keep the same winding/cull as the main pass.
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.depthBiasEnable = VK_TRUE;
+    rasterizer.depthBiasConstantFactor = 1.25f;
+    rasterizer.depthBiasSlopeFactor = 1.75f;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    // No color attachments in the shadow render pass.
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 0;
+
+    VkGraphicsPipelineCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    ci.stageCount = 1;
+    ci.pStages = &vertStage;
+    ci.pVertexInputState = &vertexInput;
+    ci.pInputAssemblyState = &inputAssembly;
+    ci.pViewportState = &viewportState;
+    ci.pRasterizationState = &rasterizer;
+    ci.pMultisampleState = &multisampling;
+    ci.pDepthStencilState = &depthStencil;
+    ci.pColorBlendState = &colorBlend;
+    ci.pDynamicState = &dynamicState;
+    ci.layout = shadowPipelineLayout_;
+    ci.renderPass = shadowRenderPass_;
+    ci.subpass = 0;
+    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE, 1, &ci, nullptr,
+                                       &shadowPipeline_));
+
     vkDestroyShaderModule(device_.handle(), vert, nullptr);
 }
 
@@ -549,6 +764,25 @@ void Renderer::createMesh(const MeshData& model) {
                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 }
 
+void Renderer::createGround() {
+    // A large flat quad at kGroundY, facing up. Indexed both windings so it's visible and casts
+    // depth regardless of the pipeline's back-face culling.
+    constexpr float h = 15.0f;
+    const std::array<Vertex, 4> vertices = {{
+        {{-h, kGroundY, -h}, {0, 1, 0}, {0, 0}, {1, 0, 0, 1}},
+        {{h, kGroundY, -h}, {0, 1, 0}, {1, 0}, {1, 0, 0, 1}},
+        {{h, kGroundY, h}, {0, 1, 0}, {1, 1}, {1, 0, 0, 1}},
+        {{-h, kGroundY, h}, {0, 1, 0}, {0, 1}, {1, 0, 0, 1}},
+    }};
+    const std::array<uint32_t, 12> indices = {0, 1, 2, 2, 3, 0, 0, 3, 2, 2, 1, 0};
+    groundIndexCount_ = static_cast<uint32_t>(indices.size());
+
+    groundVertexBuffer_ = createDeviceLocalBuffer(vertices.data(), sizeof(Vertex) * vertices.size(),
+                                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    groundIndexBuffer_ = createDeviceLocalBuffer(indices.data(), sizeof(uint32_t) * indices.size(),
+                                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+}
+
 void Renderer::createUniformBuffers() {
     uniformBuffers_.clear();
     uniformBuffers_.reserve(kFramesInFlight);
@@ -568,7 +802,7 @@ void Renderer::createDescriptorPool() {
     sizes[0].descriptorCount = kFramesInFlight;
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[1].descriptorCount =
-        kFramesInFlight * (kTextureCount + kIblTextureCount); // material + IBL maps per set
+        kFramesInFlight * (kTextureCount + kIblTextureCount + 1); // material + IBL + shadow
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -596,7 +830,7 @@ void Renderer::createDescriptorSets() {
         bufferInfo.offset = 0;
         bufferInfo.range = sizeof(CameraUBO);
 
-        constexpr int kImageBindings = kTextureCount + kIblTextureCount;
+        constexpr int kImageBindings = kTextureCount + kIblTextureCount + 1;
         std::array<VkDescriptorImageInfo, kImageBindings> imageInfos{};
         for (int t = 0; t < kTextureCount; ++t) {
             imageInfos[t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -610,6 +844,9 @@ void Renderer::createDescriptorSets() {
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         imageInfos[7] = {ibl_->lutSampler(), ibl_->brdfLutView(),
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        // Binding 9: this frame's shadow map (in depth read-only layout after the shadow pass).
+        imageInfos[8] = {shadowSampler_, shadowMaps_[i].view(),
+                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
 
         std::array<VkWriteDescriptorSet, 1 + kImageBindings> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -819,53 +1056,95 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
+    const VkExtent2D extent = swapchain_.extent();
+
+    auto setViewportScissor = [&](uint32_t w, uint32_t h) {
+        VkViewport viewport{};
+        viewport.width = static_cast<float>(w);
+        viewport.height = static_cast<float>(h);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        VkRect2D scissor{};
+        scissor.extent = {w, h};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+    };
+
+    auto bindMesh = [&](const Buffer& vb, const Buffer& ib) {
+        const VkBuffer buffers[] = {vb.handle()};
+        const VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
+        vkCmdBindIndexBuffer(cmd, ib.handle(), 0, VK_INDEX_TYPE_UINT32);
+    };
+
+    // --- Shadow pass: render scene depth from the light into this frame's shadow map. ---
+    VkClearValue shadowClear{};
+    shadowClear.depthStencil = {1.0f, 0};
+    VkRenderPassBeginInfo shadowBegin{};
+    shadowBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    shadowBegin.renderPass = shadowRenderPass_;
+    shadowBegin.framebuffer = shadowFramebuffers_[currentFrame_];
+    shadowBegin.renderArea.extent = {kShadowMapSize, kShadowMapSize};
+    shadowBegin.clearValueCount = 1;
+    shadowBegin.pClearValues = &shadowClear;
+
+    vkCmdBeginRenderPass(cmd, &shadowBegin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
+    setViewportScissor(kShadowMapSize, kShadowMapSize);
+
+    const glm::mat4 meshLightMvp = lightSpace_ * meshModel_;
+    vkCmdPushConstants(cmd, shadowPipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                       sizeof(glm::mat4), &meshLightMvp);
+    bindMesh(vertexBuffer_, indexBuffer_);
+    vkCmdDrawIndexed(cmd, indexCount_, 1, 0, 0, 0);
+
+    const glm::mat4 groundLightMvp = lightSpace_ * groundModel_;
+    vkCmdPushConstants(cmd, shadowPipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                       sizeof(glm::mat4), &groundLightMvp);
+    bindMesh(groundVertexBuffer_, groundIndexBuffer_);
+    vkCmdDrawIndexed(cmd, groundIndexCount_, 1, 0, 0, 0);
+    vkCmdEndRenderPass(cmd);
+
+    // --- Main pass: shade the scene, sampling the shadow map just written. ---
     std::array<VkClearValue, 2> clears{};
     clears[0].color = {{0.01f, 0.01f, 0.015f, 1.0f}};
-    clears[1].depthStencil = {1.0f, 0}; // clear depth to the far plane
-
-    const VkExtent2D extent = swapchain_.extent();
+    clears[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin{};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rpBegin.renderPass = renderPass_;
     rpBegin.framebuffer = framebuffers_[imageIndex];
-    rpBegin.renderArea.offset = {0, 0};
     rpBegin.renderArea.extent = extent;
     rpBegin.clearValueCount = static_cast<uint32_t>(clears.size());
     rpBegin.pClearValues = clears.data();
 
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = extent;
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-
+    setViewportScissor(extent.width, extent.height);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
                             &descriptorSets_[currentFrame_], 0, nullptr);
 
-    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(MaterialPush), &material_);
+    auto drawObject = [&](const glm::mat4& model, const MaterialPush& mat, const Buffer& vb,
+                          const Buffer& ib, uint32_t indexCount) {
+        MeshPush push{};
+        push.model = model;
+        push.baseColorFactor = mat.baseColorFactor;
+        push.emissiveFactor = mat.emissiveFactor;
+        push.metallicFactor = mat.metallicFactor;
+        push.roughnessFactor = mat.roughnessFactor;
+        vkCmdPushConstants(cmd, pipelineLayout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(MeshPush), &push);
+        bindMesh(vb, ib);
+        vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
+    };
 
-    const VkBuffer vertexBuffers[] = {vertexBuffer_.handle()};
-    const VkDeviceSize offsets[] = {0};
-    vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
-    vkCmdBindIndexBuffer(cmd, indexBuffer_.handle(), 0, VK_INDEX_TYPE_UINT32);
-
-    vkCmdDrawIndexed(cmd, indexCount_, 1, 0, 0, 0);
+    drawObject(meshModel_, material_, vertexBuffer_, indexBuffer_, indexCount_);
+    drawObject(groundModel_, groundMaterial_, groundVertexBuffer_, groundIndexBuffer_,
+               groundIndexCount_);
 
     // Skybox last: it fills only the background (depth test LESS_OR_EQUAL vs the cleared far
-    // plane), so it never overdraws the mesh but avoids shading pixels the mesh already covers.
+    // plane), so it never overdraws the scene but avoids shading pixels already covered.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipelineLayout_, 0, 1,
                             &skyboxDescriptorSets_[currentFrame_], 0, nullptr);
@@ -887,17 +1166,29 @@ void Renderer::updateUniformBuffer(uint32_t frame) {
     // Fit the mesh to a unit sphere at the origin (center it, then scale by 1/radius), spin it
     // about the up axis, and view it from a fixed 3/4 angle.
     const float fit = 1.0f / modelRadius_;
-    glm::mat4 model = glm::rotate(glm::mat4(1.0f), t * glm::radians(30.0f), glm::vec3(0, 1, 0));
-    model = glm::scale(model, glm::vec3(fit));
-    model = glm::translate(model, -modelCenter_);
+    meshModel_ = glm::rotate(glm::mat4(1.0f), t * glm::radians(30.0f), glm::vec3(0, 1, 0));
+    meshModel_ = glm::scale(meshModel_, glm::vec3(fit));
+    meshModel_ = glm::translate(meshModel_, -modelCenter_);
+    groundModel_ = glm::mat4(1.0f); // ground vertices are already in world space
+
+    // Light-space matrix: orthographic projection from the light, framing the scene near origin.
+    const glm::vec3 L = glm::normalize(kLightDir);
+    const glm::vec3 target(0.0f, -0.2f, 0.0f);
+    const glm::vec3 lightEye = target - L * 5.0f;
+    const glm::mat4 lightView = glm::lookAt(lightEye, target, glm::vec3(0.0f, 1.0f, 0.0f));
+    const float r = 2.2f; // half-extent of the shadowed region around the origin
+    const glm::mat4 lightProj = glm::ortho(-r, r, -r, r, 0.1f, 10.0f);
+    lightSpace_ = lightProj * lightView; // no Y flip: render and sample use the same matrix
 
     CameraUBO ubo{};
-    ubo.model = model;
     ubo.view = glm::lookAt(kEye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
     ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
     ubo.proj[1][1] *= -1.0f; // GLM targets OpenGL's flipped-Y clip space; undo it for Vulkan
     ubo.camPos = glm::vec4(kEye, 1.0f);
     ubo.iblParams = glm::vec4(ibl_->prefilterMaxLod(), 0.0f, 0.0f, 0.0f);
+    ubo.lightSpace = lightSpace_;
+    ubo.lightDir = glm::vec4(L, 0.0f);
+    ubo.lightColor = glm::vec4(kLightColor, 0.0f);
 
     std::memcpy(uniformBuffers_[frame].mapped(), &ubo, sizeof(ubo));
 }

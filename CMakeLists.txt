@@ -142,6 +142,7 @@ target_compile_shaders(vkrenderer
   SHADERS
     shaders/mesh.vert shaders/mesh.frag
     shaders/skybox.vert shaders/skybox.frag
+    shaders/shadow.vert
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp
     shaders/ibl_brdf.comp)

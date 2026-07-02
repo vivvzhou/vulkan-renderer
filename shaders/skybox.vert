@@ -4,11 +4,13 @@
 // camera matrices and emits it at the far plane (z = 1), so the mesh depth-tests over it.
 
 layout(binding = 0) uniform CameraUBO {
-    mat4 model;
     mat4 view;
     mat4 proj;
     vec4 camPos;
     vec4 iblParams;
+    mat4 lightSpace;
+    vec4 lightDir;
+    vec4 lightColor;
 } cam;
 
 layout(location = 0) out vec3 viewDir;

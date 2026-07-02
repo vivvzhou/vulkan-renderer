@@ -36,14 +36,17 @@ public:
 
 private:
     void createRenderPass();
+    void createShadowResources();
     void createDescriptorSetLayout();
     void createPipeline();
+    void createShadowPipeline();
     void createDepthResources();
     void createFramebuffers();
     void createCommandResources();
     void createIbl();
     void createTextures(const MeshData& model);
     void createMesh(const MeshData& model);
+    void createGround();
     void createUniformBuffers();
     void createDescriptorPool();
     void createDescriptorSets();
@@ -85,10 +88,30 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_; // one per frame in flight
 
+    // Shadow map: a per-frame offscreen depth image rendered from the light's point of view,
+    // then sampled (PCF) in the main pass. Per-frame so frames in flight don't race on it.
+    static constexpr uint32_t kShadowMapSize = 2048;
+    VkRenderPass shadowRenderPass_ = VK_NULL_HANDLE;
+    VkPipelineLayout shadowPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
+    std::array<Image, kFramesInFlight> shadowMaps_;
+    std::array<VkFramebuffer, kFramesInFlight> shadowFramebuffers_{};
+    VkSampler shadowSampler_ = VK_NULL_HANDLE;
+
     // Mesh + PBR material.
     Buffer vertexBuffer_;
     Buffer indexBuffer_;
     uint32_t indexCount_ = 0;
+
+    // Ground plane that receives the shadow (drawn with the flat-material path).
+    Buffer groundVertexBuffer_;
+    Buffer groundIndexBuffer_;
+    uint32_t groundIndexCount_ = 0;
+
+    // Per-frame transforms computed in updateUniformBuffer and reused when recording.
+    glm::mat4 meshModel_{1.0f};
+    glm::mat4 groundModel_{1.0f};
+    glm::mat4 lightSpace_{1.0f};
 
     // Five material maps, in binding order: base color, metallic-roughness, normal, emissive,
     // occlusion (see kTextureCount). One sampler is shared across all of them. The three IBL
@@ -107,13 +130,17 @@ private:
     VkDescriptorPool skyboxDescriptorPool_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> skyboxDescriptorSets_;
 
-    // Material factors pushed as push constants; layout matches the shader's Material block.
+    // Per-object material factors. emissiveFactor.w doubles as the "use textures" flag: 1 for
+    // the textured mesh, 0 for the flat-shaded ground. Combined with the model matrix into the
+    // shader push-constant block at record time.
     struct MaterialPush {
         glm::vec4 baseColorFactor{1.0f};
         glm::vec4 emissiveFactor{0.0f};
         float metallicFactor = 1.0f;
         float roughnessFactor = 1.0f;
-    } material_;
+    };
+    MaterialPush material_;       // the glTF mesh
+    MaterialPush groundMaterial_; // the ground plane
 
     // Used to auto-fit the loaded mesh (any authored scale) into view.
     glm::vec3 modelCenter_{0.0f};
