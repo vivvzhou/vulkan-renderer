@@ -12,10 +12,12 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -52,13 +54,20 @@ struct MeshPush {
 };
 
 // Fixed eye position; also fed to the fragment shader for the view vector.
-constexpr glm::vec3 kEye = glm::vec3(2.0f, 1.5f, 2.5f);
+constexpr glm::vec3 kEye = glm::vec3(9.0f, 8.0f, 14.0f);
+constexpr glm::vec3 kLookAt = glm::vec3(0.0f, -0.3f, 0.0f);
 
 // Directional key light: travel direction and radiance. Casts the shadow.
 constexpr glm::vec3 kLightDir = glm::vec3(-0.5f, -1.0f, -0.4f);
 constexpr glm::vec3 kLightColor = glm::vec3(3.0f);
 
-constexpr float kGroundY = -1.2f; // ground plane sits just below the fitted mesh
+constexpr float kGroundY = -1.2f; // ground plane sits just below the fitted meshes
+
+// A grid of mesh instances so the multithreaded recording has real work to partition.
+constexpr int kGridDim = 5; // kGridDim^2 instances
+constexpr float kGridSpacing = 2.4f;
+constexpr float kInstanceScale = 0.9f; // fitted mesh radius after scaling
+constexpr float kInstanceY = -0.3f;    // instance center height (rests on the ground)
 
 std::vector<char> readFile(const std::string& path) {
     std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -101,6 +110,7 @@ Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapcha
     createGBuffers();
     createFramebuffers();
     createCommandResources();
+    createThreadResources();
     createIbl();
     createTextures(model);
     createMesh(model);
@@ -136,6 +146,11 @@ Renderer::~Renderer() {
     }
     if (commandPool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(dev, commandPool_, nullptr);
+    }
+    for (VkCommandPool pool : threadCommandPools_) {
+        if (pool != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(dev, pool, nullptr);
+        }
     }
     if (shadowSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(dev, shadowSampler_, nullptr);
@@ -808,6 +823,26 @@ void Renderer::createCommandResources() {
     VK_CHECK(vkAllocateCommandBuffers(device_.handle(), &allocInfo, commandBuffers_.data()));
 }
 
+void Renderer::createThreadResources() {
+    // Each worker gets its own command pool (pools are externally synchronized) and one secondary
+    // command buffer per frame in flight.
+    for (int t = 0; t < kThreadCount; ++t) {
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = *device_.queueFamilies().graphics;
+        VK_CHECK(vkCreateCommandPool(device_.handle(), &poolInfo, nullptr, &threadCommandPools_[t]));
+
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = threadCommandPools_[t];
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        allocInfo.commandBufferCount = kFramesInFlight;
+        VK_CHECK(vkAllocateCommandBuffers(device_.handle(), &allocInfo,
+                                          geomSecondaries_[t].data()));
+    }
+}
+
 void Renderer::createIbl() {
     // Precompute irradiance / prefilter / BRDF LUT from the HDR environment (uses commandPool_).
     ibl_ = std::make_unique<Ibl>(device_.handle(), allocator_.handle(), device_.graphicsQueue(),
@@ -1130,6 +1165,92 @@ void Renderer::createSyncObjects() {
     }
 }
 
+void Renderer::buildInstances(float time) {
+    // A grid of spinning mesh instances (staggered rotation phase) plus the ground plane.
+    instances_.clear();
+    instances_.reserve(static_cast<size_t>(kGridDim) * kGridDim + 1);
+    const float fit = kInstanceScale / modelRadius_;
+    const float half = (kGridDim - 1) * 0.5f;
+    for (int j = 0; j < kGridDim; ++j) {
+        for (int i = 0; i < kGridDim; ++i) {
+            const float x = (static_cast<float>(i) - half) * kGridSpacing;
+            const float z = (static_cast<float>(j) - half) * kGridSpacing;
+            const float phase = static_cast<float>(i * kGridDim + j) * 0.7f;
+            glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(x, kInstanceY, z));
+            m = glm::rotate(m, time * glm::radians(30.0f) + phase, glm::vec3(0, 1, 0));
+            m = glm::scale(m, glm::vec3(fit));
+            m = glm::translate(m, -modelCenter_);
+            instances_.push_back({m, &vertexBuffer_, &indexBuffer_, indexCount_,
+                                  material_.baseColorFactor, material_.emissiveFactor,
+                                  material_.metallicFactor, material_.roughnessFactor});
+        }
+    }
+    instances_.push_back({groundModel_, &groundVertexBuffer_, &groundIndexBuffer_,
+                          groundIndexCount_, groundMaterial_.baseColorFactor,
+                          groundMaterial_.emissiveFactor, groundMaterial_.metallicFactor,
+                          groundMaterial_.roughnessFactor});
+}
+
+void Renderer::recordGeometrySecondary(int threadIndex, uint32_t frame, VkExtent2D extent) {
+    // Partition the instance list into contiguous chunks, one per worker.
+    const size_t total = instances_.size();
+    const size_t per = (total + kThreadCount - 1) / kThreadCount;
+    const size_t begin = std::min(static_cast<size_t>(threadIndex) * per, total);
+    const size_t end = std::min(begin + per, total);
+
+    VkCommandBuffer sec = geomSecondaries_[threadIndex][frame];
+    VK_CHECK(vkResetCommandBuffer(sec, 0));
+
+    // A secondary that continues the geometry render pass must inherit it.
+    VkCommandBufferInheritanceInfo inherit{};
+    inherit.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+    inherit.renderPass = geomRenderPass_;
+    inherit.subpass = 0;
+    inherit.framebuffer = gbuffers_[frame].framebuffer;
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT |
+                      VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    beginInfo.pInheritanceInfo = &inherit;
+    VK_CHECK(vkBeginCommandBuffer(sec, &beginInfo));
+
+    // State does not inherit across the primary/secondary boundary; set it here.
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(sec, 0, 1, &viewport);
+    VkRect2D scissor{};
+    scissor.extent = extent;
+    vkCmdSetScissor(sec, 0, 1, &scissor);
+
+    vkCmdBindPipeline(sec, VK_PIPELINE_BIND_POINT_GRAPHICS, geomPipeline_);
+    vkCmdBindDescriptorSets(sec, VK_PIPELINE_BIND_POINT_GRAPHICS, geomPipelineLayout_, 0, 1,
+                            &geomDescriptorSets_[frame], 0, nullptr);
+
+    for (size_t idx = begin; idx < end; ++idx) {
+        const DrawInstance& inst = instances_[idx];
+        MeshPush push{};
+        push.model = inst.model;
+        push.baseColorFactor = inst.baseColorFactor;
+        push.emissiveFactor = inst.emissiveFactor;
+        push.metallicFactor = inst.metallicFactor;
+        push.roughnessFactor = inst.roughnessFactor;
+        vkCmdPushConstants(sec, geomPipelineLayout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(MeshPush), &push);
+        const VkBuffer buffers[] = {inst.vertexBuffer->handle()};
+        const VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(sec, 0, 1, buffers, offsets);
+        vkCmdBindIndexBuffer(sec, inst.indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(sec, inst.indexCount, 1, 0, 0, 0);
+    }
+
+    VK_CHECK(vkEndCommandBuffer(sec));
+}
+
 void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1171,20 +1292,16 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
     setViewportScissor(kShadowMapSize, kShadowMapSize);
 
-    const glm::mat4 meshLightMvp = lightSpace_ * meshModel_;
-    vkCmdPushConstants(cmd, shadowPipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                       sizeof(glm::mat4), &meshLightMvp);
-    bindMesh(vertexBuffer_, indexBuffer_);
-    vkCmdDrawIndexed(cmd, indexCount_, 1, 0, 0, 0);
-
-    const glm::mat4 groundLightMvp = lightSpace_ * groundModel_;
-    vkCmdPushConstants(cmd, shadowPipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                       sizeof(glm::mat4), &groundLightMvp);
-    bindMesh(groundVertexBuffer_, groundIndexBuffer_);
-    vkCmdDrawIndexed(cmd, groundIndexCount_, 1, 0, 0, 0);
+    for (const DrawInstance& inst : instances_) {
+        const glm::mat4 lightMvp = lightSpace_ * inst.model;
+        vkCmdPushConstants(cmd, shadowPipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(glm::mat4), &lightMvp);
+        bindMesh(*inst.vertexBuffer, *inst.indexBuffer);
+        vkCmdDrawIndexed(cmd, inst.indexCount, 1, 0, 0, 0);
+    }
     vkCmdEndRenderPass(cmd);
 
-    // --- Geometry pass: fill this frame's G-buffer with surface attributes. ---
+    // --- Geometry pass: fill the G-buffer, recording the draws across worker threads. ---
     std::array<VkClearValue, kGBufferCount + 1> geomClears{};
     geomClears[kGBufferCount].depthStencil = {1.0f, 0}; // color targets clear to zero
 
@@ -1196,30 +1313,22 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     geomBegin.clearValueCount = static_cast<uint32_t>(geomClears.size());
     geomBegin.pClearValues = geomClears.data();
 
-    vkCmdBeginRenderPass(cmd, &geomBegin, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, geomPipeline_);
-    setViewportScissor(extent.width, extent.height);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, geomPipelineLayout_, 0, 1,
-                            &geomDescriptorSets_[currentFrame_], 0, nullptr);
+    // Contents are supplied by secondary command buffers recorded in parallel below.
+    vkCmdBeginRenderPass(cmd, &geomBegin, VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
 
-    auto drawObject = [&](const glm::mat4& model, const MaterialPush& mat, const Buffer& vb,
-                          const Buffer& ib, uint32_t indexCount) {
-        MeshPush push{};
-        push.model = model;
-        push.baseColorFactor = mat.baseColorFactor;
-        push.emissiveFactor = mat.emissiveFactor;
-        push.metallicFactor = mat.metallicFactor;
-        push.roughnessFactor = mat.roughnessFactor;
-        vkCmdPushConstants(cmd, geomPipelineLayout_,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof(MeshPush), &push);
-        bindMesh(vb, ib);
-        vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
-    };
+    const uint32_t frame = currentFrame_;
+    std::vector<std::function<void()>> tasks;
+    tasks.reserve(kThreadCount);
+    for (int t = 0; t < kThreadCount; ++t) {
+        tasks.emplace_back([this, t, frame, extent] { recordGeometrySecondary(t, frame, extent); });
+    }
+    threadPool_.dispatch(std::move(tasks)); // fork/join: blocks until all secondaries are recorded
 
-    drawObject(meshModel_, material_, vertexBuffer_, indexBuffer_, indexCount_);
-    drawObject(groundModel_, groundMaterial_, groundVertexBuffer_, groundIndexBuffer_,
-               groundIndexCount_);
+    std::array<VkCommandBuffer, kThreadCount> secondaries{};
+    for (int t = 0; t < kThreadCount; ++t) {
+        secondaries[t] = geomSecondaries_[t][frame];
+    }
+    vkCmdExecuteCommands(cmd, static_cast<uint32_t>(secondaries.size()), secondaries.data());
     vkCmdEndRenderPass(cmd);
 
     // --- Lighting pass: fullscreen shading, sampling the G-buffer + shadow + IBL. ---
@@ -1250,25 +1359,20 @@ void Renderer::updateUniformBuffer(uint32_t frame) {
     const float aspect = static_cast<float>(extent.width) /
                          static_cast<float>(extent.height == 0 ? 1 : extent.height);
 
-    // Fit the mesh to a unit sphere at the origin (center it, then scale by 1/radius), spin it
-    // about the up axis, and view it from a fixed 3/4 angle.
-    const float fit = 1.0f / modelRadius_;
-    meshModel_ = glm::rotate(glm::mat4(1.0f), t * glm::radians(30.0f), glm::vec3(0, 1, 0));
-    meshModel_ = glm::scale(meshModel_, glm::vec3(fit));
-    meshModel_ = glm::translate(meshModel_, -modelCenter_);
     groundModel_ = glm::mat4(1.0f); // ground vertices are already in world space
+    buildInstances(t);              // rebuild the per-frame instance grid for the workers
 
-    // Light-space matrix: orthographic projection from the light, framing the scene near origin.
+    // Light-space matrix: orthographic projection from the light, wide enough to cover the grid.
     const glm::vec3 L = glm::normalize(kLightDir);
-    const glm::vec3 target(0.0f, -0.2f, 0.0f);
-    const glm::vec3 lightEye = target - L * 5.0f;
+    const glm::vec3 target = kLookAt;
+    const glm::vec3 lightEye = target - L * 14.0f;
     const glm::mat4 lightView = glm::lookAt(lightEye, target, glm::vec3(0.0f, 1.0f, 0.0f));
-    const float r = 2.2f; // half-extent of the shadowed region around the origin
-    const glm::mat4 lightProj = glm::ortho(-r, r, -r, r, 0.1f, 10.0f);
+    const float r = 7.5f; // half-extent of the shadowed region around the grid
+    const glm::mat4 lightProj = glm::ortho(-r, r, -r, r, 0.1f, 40.0f);
     lightSpace_ = lightProj * lightView; // no Y flip: render and sample use the same matrix
 
     CameraUBO ubo{};
-    ubo.view = glm::lookAt(kEye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    ubo.view = glm::lookAt(kEye, kLookAt, glm::vec3(0.0f, 1.0f, 0.0f));
     ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
     ubo.proj[1][1] *= -1.0f; // GLM targets OpenGL's flipped-Y clip space; undo it for Vulkan
     ubo.camPos = glm::vec4(kEye, 1.0f);

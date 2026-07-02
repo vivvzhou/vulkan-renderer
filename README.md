@@ -18,7 +18,7 @@ Built incrementally in phases — each one a runnable milestone:
 - [x] **Phase 3** — PBR (GGX) + image-based lighting
 - [x] **Phase 4** — shadow mapping
 - [x] **Phase 5** — deferred G-buffer
-- [ ] **Phase 6** — multithreaded secondary command buffers
+- [x] **Phase 6** — multithreaded secondary command buffers
 - [ ] **Phase 7** — custom `VkDeviceMemory` allocator
 - [ ] **Phase 8** — pipeline cache + GPU timestamp profiling
 - [ ] **Phase 9** — neural ambient occlusion (offline-trained MLP, GLSL compute inference)

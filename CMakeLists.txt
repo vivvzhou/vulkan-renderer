@@ -99,6 +99,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
 add_executable(vkrenderer
   src/main.cpp
   src/core/Window.cpp
+  src/core/ThreadPool.cpp
   src/vk/Instance.cpp
   src/vk/Device.cpp
   src/vk/Swapchain.cpp

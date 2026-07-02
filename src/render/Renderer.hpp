@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include "core/ThreadPool.hpp"
 #include "vk/Buffer.hpp"
 #include "vk/Image.hpp"
 
@@ -45,6 +46,7 @@ private:
     void createGBuffers();
     void createFramebuffers();
     void createCommandResources();
+    void createThreadResources();
     void createIbl();
     void createTextures(const MeshData& model);
     void createMesh(const MeshData& model);
@@ -57,6 +59,8 @@ private:
     void createSyncObjects();
 
     void recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
+    void buildInstances(float time);
+    void recordGeometrySecondary(int threadIndex, uint32_t frame, VkExtent2D extent);
     void updateUniformBuffer(uint32_t frame);
     void drawFrame();
     void recreateSwapchain();
@@ -73,6 +77,7 @@ private:
     static constexpr int kIblTextureCount = 3; // irradiance, prefilter, brdf LUT
     static constexpr int kGBufferCount = 4;    // position, normal, albedo, emissive
     static constexpr uint32_t kShadowMapSize = 2048;
+    static constexpr int kThreadCount = 4;     // parallel geometry-recording workers
 
     Window& window_;
     Device& device_;
@@ -115,6 +120,26 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
 
+    // Multithreaded geometry recording: one worker + command pool per thread, each producing a
+    // secondary command buffer per frame in flight. Command pools are not thread-safe, so each
+    // worker owns its own.
+    ThreadPool threadPool_{kThreadCount};
+    std::array<VkCommandPool, kThreadCount> threadCommandPools_{};
+    std::array<std::array<VkCommandBuffer, kFramesInFlight>, kThreadCount> geomSecondaries_{};
+
+    // One draw's worth of state; the per-frame instance list is partitioned across the workers.
+    struct DrawInstance {
+        glm::mat4 model;
+        const Buffer* vertexBuffer;
+        const Buffer* indexBuffer;
+        uint32_t indexCount;
+        glm::vec4 baseColorFactor;
+        glm::vec4 emissiveFactor; // w = useTextures flag
+        float metallicFactor;
+        float roughnessFactor;
+    };
+    std::vector<DrawInstance> instances_;
+
     // Material maps (bindings 1..5 of the geometry set). One sampler shared across them.
     std::array<Image, kTextureCount> textures_;
     VkSampler sampler_ = VK_NULL_HANDLE;
@@ -143,7 +168,6 @@ private:
     float modelRadius_ = 1.0f;
 
     // Per-frame transforms computed in updateUniformBuffer and reused when recording.
-    glm::mat4 meshModel_{1.0f};
     glm::mat4 groundModel_{1.0f};
     glm::mat4 lightSpace_{1.0f};
 
