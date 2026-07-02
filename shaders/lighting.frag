@@ -1,8 +1,7 @@
 #version 450
 
-// Metallic-roughness PBR: IBL ambient + one shadowed analytic directional light. Objects with
-// useTextures == 0 (the ground plane) skip the material maps and shade from the push-constant
-// factors instead.
+// Deferred lighting pass: read the G-buffer and shade each pixel with the shadowed directional
+// light plus split-sum IBL. Background pixels (no geometry written) show the environment.
 
 layout(binding = 0) uniform CameraUBO {
     mat4 view;
@@ -14,28 +13,18 @@ layout(binding = 0) uniform CameraUBO {
     vec4 lightColor;
 } cam;
 
-layout(binding = 1) uniform sampler2D baseColorMap;
-layout(binding = 2) uniform sampler2D metalRoughMap;
-layout(binding = 3) uniform sampler2D normalMap;
-layout(binding = 4) uniform sampler2D emissiveMap;
-layout(binding = 5) uniform sampler2D occlusionMap;
+layout(binding = 1) uniform sampler2D gPosition; // xyz world position
+layout(binding = 2) uniform sampler2D gNormal;   // xyz normal, w roughness
+layout(binding = 3) uniform sampler2D gAlbedo;   // rgb albedo, a metallic
+layout(binding = 4) uniform sampler2D gEmissive; // rgb emissive, a ao
+layout(binding = 5) uniform sampler2D shadowMap;
 layout(binding = 6) uniform sampler2D irradianceMap;
 layout(binding = 7) uniform sampler2D prefilterMap;
 layout(binding = 8) uniform sampler2D brdfLut;
-layout(binding = 9) uniform sampler2D shadowMap;
+layout(binding = 9) uniform sampler2D environmentMap;
 
-layout(push_constant) uniform PushConstants {
-    mat4 model;
-    vec4 baseColorFactor;
-    vec4 emissiveFactor; // w = useTextures flag
-    float metallicFactor;
-    float roughnessFactor;
-} pc;
-
-layout(location = 0) in vec3 fragWorldPos;
-layout(location = 1) in vec3 fragNormal;
-layout(location = 2) in vec2 fragUV;
-layout(location = 3) in vec4 fragTangent;
+layout(location = 0) in vec2 fragUV;
+layout(location = 1) in vec3 viewDir;
 
 layout(location = 0) out vec4 outColor;
 
@@ -69,21 +58,16 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
     return F0 + (Fr - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-vec3 getNormal() {
-    vec3 tangentNormal = texture(normalMap, fragUV).xyz * 2.0 - 1.0;
-    vec3 N = normalize(fragNormal);
-    vec3 T = normalize(fragTangent.xyz);
-    vec3 B = cross(N, T) * fragTangent.w;
-    return normalize(mat3(T, B, N) * tangentNormal);
+vec3 aces(vec3 c) {
+    return clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), 0.0, 1.0);
 }
 
-// 3x3 PCF. Returns 1.0 (fully lit) .. 0.0 (fully shadowed).
-float computeShadow(vec3 N, vec3 L) {
-    vec4 lightClip = cam.lightSpace * vec4(fragWorldPos, 1.0);
+float computeShadow(vec3 worldPos, vec3 N, vec3 L) {
+    vec4 lightClip = cam.lightSpace * vec4(worldPos, 1.0);
     vec3 proj = lightClip.xyz / lightClip.w;
     vec2 uv = proj.xy * 0.5 + 0.5;
     if (proj.z > 1.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        return 1.0; // outside the light frustum -> treat as lit
+        return 1.0;
     }
     float bias = max(0.0025 * (1.0 - max(dot(N, L), 0.0)), 0.0008);
     vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
@@ -98,37 +82,31 @@ float computeShadow(vec3 N, vec3 L) {
 }
 
 void main() {
-    bool useTextures = pc.emissiveFactor.w > 0.5;
+    vec4 packedNormal = texture(gNormal, fragUV);
+    vec3 N = packedNormal.xyz;
 
-    vec3 albedo;
-    float roughness;
-    float metallic;
-    float ao;
-    vec3 emissive;
-    vec3 N;
-    if (useTextures) {
-        albedo = (texture(baseColorMap, fragUV) * pc.baseColorFactor).rgb;
-        vec3 mr = texture(metalRoughMap, fragUV).rgb;
-        roughness = clamp(mr.g * pc.roughnessFactor, 0.04, 1.0);
-        metallic = mr.b * pc.metallicFactor;
-        ao = texture(occlusionMap, fragUV).r;
-        emissive = texture(emissiveMap, fragUV).rgb * pc.emissiveFactor.xyz;
-        N = getNormal();
-    } else {
-        albedo = pc.baseColorFactor.rgb;
-        roughness = clamp(pc.roughnessFactor, 0.04, 1.0);
-        metallic = pc.metallicFactor;
-        ao = 1.0;
-        emissive = vec3(0.0);
-        N = normalize(fragNormal);
+    // Background: the geometry pass cleared the normal to zero here, so show the environment.
+    if (dot(N, N) < 0.5) {
+        outColor = vec4(aces(texture(environmentMap, dirToUv(normalize(viewDir))).rgb), 1.0);
+        return;
     }
 
-    vec3 V = normalize(cam.camPos.xyz - fragWorldPos);
+    N = normalize(N);
+    float roughness = packedNormal.w;
+    vec3 worldPos = texture(gPosition, fragUV).xyz;
+    vec4 albedoMetallic = texture(gAlbedo, fragUV);
+    vec3 albedo = albedoMetallic.rgb;
+    float metallic = albedoMetallic.a;
+    vec4 emissiveAo = texture(gEmissive, fragUV);
+    vec3 emissive = emissiveAo.rgb;
+    float ao = emissiveAo.a;
+
+    vec3 V = normalize(cam.camPos.xyz - worldPos);
     vec3 R = reflect(-V, N);
     float NdotV = max(dot(N, V), 0.0);
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
-    // Shadowed directional light (Cook-Torrance).
+    // Shadowed directional light.
     vec3 L = normalize(-cam.lightDir.xyz);
     vec3 H = normalize(V + L);
     float NdotL = max(dot(N, L), 0.0);
@@ -137,7 +115,7 @@ void main() {
     vec3 Fdir = fresnelSchlick(max(dot(H, V), 0.0), F0);
     vec3 specular = (NDF * G * Fdir) / (4.0 * NdotV * NdotL + 0.0001);
     vec3 kDdir = (1.0 - Fdir) * (1.0 - metallic);
-    float shadow = computeShadow(N, L);
+    float shadow = computeShadow(worldPos, N, L);
     vec3 Lo = (kDdir * albedo / PI + specular) * cam.lightColor.rgb * NdotL * shadow;
 
     // Ambient IBL (split sum).
@@ -150,7 +128,5 @@ void main() {
     vec3 specularIBL = prefiltered * (F * envBRDF.x + envBRDF.y);
     vec3 ambient = (kD * diffuseIBL + specularIBL) * ao;
 
-    vec3 color = ambient + Lo + emissive;
-    color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14); // ACES
-    outColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+    outColor = vec4(aces(ambient + Lo + emissive), 1.0);
 }

@@ -17,7 +17,7 @@ Built incrementally in phases — each one a runnable milestone:
 - [x] **Phase 2** — VMA, buffers, depth, camera, textured glTF mesh
 - [x] **Phase 3** — PBR (GGX) + image-based lighting
 - [x] **Phase 4** — shadow mapping
-- [ ] **Phase 5** — deferred G-buffer
+- [x] **Phase 5** — deferred G-buffer
 - [ ] **Phase 6** — multithreaded secondary command buffers
 - [ ] **Phase 7** — custom `VkDeviceMemory` allocator
 - [ ] **Phase 8** — pipeline cache + GPU timestamp profiling

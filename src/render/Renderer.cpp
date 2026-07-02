@@ -91,12 +91,14 @@ Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapcha
     groundMaterial_.roughnessFactor = 0.85f;
 
     depthFormat_ = findDepthFormat();
-    createRenderPass();
     createShadowResources();
-    createDescriptorSetLayout();
-    createPipeline();
+    createGeometryRenderPass();
+    createLightingRenderPass();
+    createDescriptorSetLayouts();
+    createGeometryPipeline();
     createShadowPipeline();
-    createDepthResources();
+    createLightingPipeline();
+    createGBuffers();
     createFramebuffers();
     createCommandResources();
     createIbl();
@@ -105,9 +107,8 @@ Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapcha
     createGround();
     createUniformBuffers();
     createDescriptorPool();
-    createDescriptorSets();
-    createSkyboxPipeline();
-    createSkyboxDescriptors();
+    createGeomDescriptors();
+    createLightDescriptors();
     createSyncObjects();
 }
 
@@ -124,23 +125,14 @@ Renderer::~Renderer() {
     for (VkFence f : inFlight_) {
         vkDestroyFence(dev, f, nullptr);
     }
-    if (skyboxDescriptorPool_ != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(dev, skyboxDescriptorPool_, nullptr);
-    }
-    if (skyboxPipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(dev, skyboxPipeline_, nullptr);
-    }
-    if (skyboxPipelineLayout_ != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(dev, skyboxPipelineLayout_, nullptr);
-    }
-    if (skyboxSetLayout_ != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(dev, skyboxSetLayout_, nullptr);
-    }
     if (descriptorPool_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(dev, descriptorPool_, nullptr);
     }
     if (sampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(dev, sampler_, nullptr);
+    }
+    if (gbufferSampler_ != VK_NULL_HANDLE) {
+        vkDestroySampler(dev, gbufferSampler_, nullptr);
     }
     if (commandPool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(dev, commandPool_, nullptr);
@@ -162,22 +154,39 @@ Renderer::~Renderer() {
     if (shadowRenderPass_ != VK_NULL_HANDLE) {
         vkDestroyRenderPass(dev, shadowRenderPass_, nullptr);
     }
+    for (GBuffer& gb : gbuffers_) {
+        if (gb.framebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(dev, gb.framebuffer, nullptr);
+        }
+    }
     for (VkFramebuffer fb : framebuffers_) {
         vkDestroyFramebuffer(dev, fb, nullptr);
     }
-    if (pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(dev, pipeline_, nullptr);
+    if (lightPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, lightPipeline_, nullptr);
     }
-    if (pipelineLayout_ != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(dev, pipelineLayout_, nullptr);
+    if (lightPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, lightPipelineLayout_, nullptr);
     }
-    if (descriptorSetLayout_ != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(dev, descriptorSetLayout_, nullptr);
+    if (lightSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, lightSetLayout_, nullptr);
     }
-    if (renderPass_ != VK_NULL_HANDLE) {
-        vkDestroyRenderPass(dev, renderPass_, nullptr);
+    if (lightRenderPass_ != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(dev, lightRenderPass_, nullptr);
     }
-    // Buffer/Image members (mesh, texture, depth, uniforms) free themselves via VMA here.
+    if (geomPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, geomPipeline_, nullptr);
+    }
+    if (geomPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, geomPipelineLayout_, nullptr);
+    }
+    if (geomSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, geomSetLayout_, nullptr);
+    }
+    if (geomRenderPass_ != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(dev, geomRenderPass_, nullptr);
+    }
+    // Buffer/Image members (mesh, textures, G-buffer, uniforms) free themselves via VMA here.
 }
 
 VkFormat Renderer::findDepthFormat() const {
@@ -207,54 +216,68 @@ VkShaderModule Renderer::loadShaderModule(const char* path) {
     return module;
 }
 
-void Renderer::createRenderPass() {
-    VkAttachmentDescription color{};
-    color.format = swapchain_.imageFormat();
-    color.samples = VK_SAMPLE_COUNT_1_BIT;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+// G-buffer attachment formats: position/normal need float precision; albedo/emissive fit in 8-bit.
+static constexpr VkFormat kGPositionFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+static constexpr VkFormat kGNormalFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+static constexpr VkFormat kGAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;
+static constexpr VkFormat kGEmissiveFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
-    VkAttachmentDescription depth{};
+void Renderer::createGeometryRenderPass() {
+    // Four color targets + depth. All colors end in SHADER_READ_ONLY so the lighting pass can
+    // sample them. Depth is transient (used only for the geometry pass's own depth test).
+    const std::array<VkFormat, kGBufferCount> colorFormats = {kGPositionFormat, kGNormalFormat,
+                                                              kGAlbedoFormat, kGEmissiveFormat};
+    std::array<VkAttachmentDescription, kGBufferCount + 1> attachments{};
+    std::array<VkAttachmentReference, kGBufferCount> colorRefs{};
+    for (int i = 0; i < kGBufferCount; ++i) {
+        attachments[i].format = colorFormats[i];
+        attachments[i].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachments[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[i].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachments[i].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        colorRefs[i].attachment = static_cast<uint32_t>(i);
+        colorRefs[i].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+
+    VkAttachmentDescription& depth = attachments[kGBufferCount];
     depth.format = depthFormat_;
     depth.samples = VK_SAMPLE_COUNT_1_BIT;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; // not needed after the frame
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-    VkAttachmentReference colorRef{};
-    colorRef.attachment = 0;
-    colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
     VkAttachmentReference depthRef{};
-    depthRef.attachment = 1;
+    depthRef.attachment = kGBufferCount;
     depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &colorRef;
+    subpass.colorAttachmentCount = kGBufferCount;
+    subpass.pColorAttachments = colorRefs.data();
     subpass.pDepthStencilAttachment = &depthRef;
 
-    // Wait for the previous frame's color output and depth tests before we write either.
-    VkSubpassDependency dependency{};
-    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dependency.dstSubpass = 0;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependency.srcAccessMask = 0;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-    const std::array<VkAttachmentDescription, 2> attachments = {color, depth};
+    // Make the written G-buffer available to the lighting pass's samplers.
+    std::array<VkSubpassDependency, 2> deps{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
     VkRenderPassCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -262,10 +285,49 @@ void Renderer::createRenderPass() {
     ci.pAttachments = attachments.data();
     ci.subpassCount = 1;
     ci.pSubpasses = &subpass;
+    ci.dependencyCount = static_cast<uint32_t>(deps.size());
+    ci.pDependencies = deps.data();
+    VK_CHECK(vkCreateRenderPass(device_.handle(), &ci, nullptr, &geomRenderPass_));
+}
+
+void Renderer::createLightingRenderPass() {
+    // Single color target: the swapchain image. The fullscreen lighting pass covers every pixel.
+    VkAttachmentDescription color{};
+    color.format = swapchain_.imageFormat();
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; // every pixel is written
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkAttachmentReference colorRef{};
+    colorRef.attachment = 0;
+    colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcAccessMask = 0;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    ci.attachmentCount = 1;
+    ci.pAttachments = &color;
+    ci.subpassCount = 1;
+    ci.pSubpasses = &subpass;
     ci.dependencyCount = 1;
     ci.pDependencies = &dependency;
-
-    VK_CHECK(vkCreateRenderPass(device_.handle(), &ci, nullptr, &renderPass_));
+    VK_CHECK(vkCreateRenderPass(device_.handle(), &ci, nullptr, &lightRenderPass_));
 }
 
 void Renderer::createShadowResources() {
@@ -346,46 +408,63 @@ void Renderer::createShadowResources() {
     VK_CHECK(vkCreateSampler(device_.handle(), &si, nullptr, &shadowSampler_));
 }
 
-void Renderer::createDescriptorSetLayout() {
-    // Binding 0: camera UBO (vertex builds clip pos, fragment needs the eye for the view vector).
-    // Bindings 1..5: material maps. Bindings 6..8: IBL maps. Binding 9: the shadow map.
-    constexpr int kImageBindings = kTextureCount + kIblTextureCount + 1;
-    std::array<VkDescriptorSetLayoutBinding, 1 + kImageBindings> bindings{};
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-
-    for (int i = 0; i < kImageBindings; ++i) {
-        bindings[i + 1].binding = static_cast<uint32_t>(i + 1);
-        bindings[i + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bindings[i + 1].descriptorCount = 1;
-        bindings[i + 1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+void Renderer::createDescriptorSetLayouts() {
+    // Geometry set: UBO (binding 0, vertex) + the five material maps (bindings 1..5, fragment).
+    {
+        std::array<VkDescriptorSetLayoutBinding, 1 + kTextureCount> bindings{};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        for (int i = 0; i < kTextureCount; ++i) {
+            bindings[i + 1].binding = static_cast<uint32_t>(i + 1);
+            bindings[i + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[i + 1].descriptorCount = 1;
+            bindings[i + 1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        ci.bindingCount = static_cast<uint32_t>(bindings.size());
+        ci.pBindings = bindings.data();
+        VK_CHECK(vkCreateDescriptorSetLayout(device_.handle(), &ci, nullptr, &geomSetLayout_));
     }
 
-    VkDescriptorSetLayoutCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    ci.bindingCount = static_cast<uint32_t>(bindings.size());
-    ci.pBindings = bindings.data();
-    VK_CHECK(vkCreateDescriptorSetLayout(device_.handle(), &ci, nullptr, &descriptorSetLayout_));
+    // Lighting set: UBO (0, vertex+fragment) + 4 G-buffer + shadow + 3 IBL + environment maps.
+    {
+        constexpr int kImageBindings = kGBufferCount + 1 + kIblTextureCount + 1;
+        std::array<VkDescriptorSetLayoutBinding, 1 + kImageBindings> bindings{};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        for (int i = 0; i < kImageBindings; ++i) {
+            bindings[i + 1].binding = static_cast<uint32_t>(i + 1);
+            bindings[i + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[i + 1].descriptorCount = 1;
+            bindings[i + 1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        ci.bindingCount = static_cast<uint32_t>(bindings.size());
+        ci.pBindings = bindings.data();
+        VK_CHECK(vkCreateDescriptorSetLayout(device_.handle(), &ci, nullptr, &lightSetLayout_));
+    }
 }
 
-void Renderer::createPipeline() {
-    VkShaderModule vert = loadShaderModule("mesh.vert.spv");
-    VkShaderModule frag = loadShaderModule("mesh.frag.spv");
+void Renderer::createGeometryPipeline() {
+    VkShaderModule vert = loadShaderModule("gbuffer.vert.spv");
+    VkShaderModule frag = loadShaderModule("gbuffer.frag.spv");
 
     VkPipelineShaderStageCreateInfo vertStage{};
     vertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     vertStage.module = vert;
     vertStage.pName = "main";
-
     VkPipelineShaderStageCreateInfo fragStage{};
     fragStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     fragStage.module = frag;
     fragStage.pName = "main";
-
     const std::array<VkPipelineShaderStageCreateInfo, 2> stages = {vertStage, fragStage};
 
     const auto binding = Vertex::bindingDescription();
@@ -417,8 +496,6 @@ void Renderer::createPipeline() {
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    // We flip Y in the projection matrix (Vulkan clip space), which reverses winding, so our
-    // counter-clockwise cube faces present as front-facing under this setting.
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.lineWidth = 1.0f;
 
@@ -430,19 +507,19 @@ void Renderer::createPipeline() {
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable = VK_TRUE;
     depthStencil.depthWriteEnable = VK_TRUE;
-    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS; // smaller depth = closer, wins
-    depthStencil.depthBoundsTestEnable = VK_FALSE;
-    depthStencil.stencilTestEnable = VK_FALSE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
 
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blendAttachment.blendEnable = VK_FALSE;
-
+    // One blend attachment per G-buffer target (blending disabled on all of them).
+    std::array<VkPipelineColorBlendAttachmentState, kGBufferCount> blendAttachments{};
+    for (auto& b : blendAttachments) {
+        b.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        b.blendEnable = VK_FALSE;
+    }
     VkPipelineColorBlendStateCreateInfo colorBlend{};
     colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlend.attachmentCount = 1;
-    colorBlend.pAttachments = &blendAttachment;
+    colorBlend.attachmentCount = static_cast<uint32_t>(blendAttachments.size());
+    colorBlend.pAttachments = blendAttachments.data();
 
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -452,10 +529,10 @@ void Renderer::createPipeline() {
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layoutInfo.setLayoutCount = 1;
-    layoutInfo.pSetLayouts = &descriptorSetLayout_;
+    layoutInfo.pSetLayouts = &geomSetLayout_;
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges = &pushRange;
-    VK_CHECK(vkCreatePipelineLayout(device_.handle(), &layoutInfo, nullptr, &pipelineLayout_));
+    VK_CHECK(vkCreatePipelineLayout(device_.handle(), &layoutInfo, nullptr, &geomPipelineLayout_));
 
     VkGraphicsPipelineCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -469,12 +546,100 @@ void Renderer::createPipeline() {
     ci.pDepthStencilState = &depthStencil;
     ci.pColorBlendState = &colorBlend;
     ci.pDynamicState = &dynamicState;
-    ci.layout = pipelineLayout_;
-    ci.renderPass = renderPass_;
+    ci.layout = geomPipelineLayout_;
+    ci.renderPass = geomRenderPass_;
     ci.subpass = 0;
-
     VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE, 1, &ci, nullptr,
-                                       &pipeline_));
+                                       &geomPipeline_));
+
+    vkDestroyShaderModule(device_.handle(), frag, nullptr);
+    vkDestroyShaderModule(device_.handle(), vert, nullptr);
+}
+
+void Renderer::createLightingPipeline() {
+    VkShaderModule vert = loadShaderModule("lighting.vert.spv");
+    VkShaderModule frag = loadShaderModule("lighting.frag.spv");
+
+    VkPipelineShaderStageCreateInfo vertStage{};
+    vertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertStage.module = vert;
+    vertStage.pName = "main";
+    VkPipelineShaderStageCreateInfo fragStage{};
+    fragStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragStage.module = frag;
+    fragStage.pName = "main";
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages = {vertStage, fragStage};
+
+    // No vertex input: a shader-generated fullscreen triangle.
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    const std::array<VkDynamicState, 2> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                         VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_FALSE;
+    depthStencil.depthWriteEnable = VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blendAttachment.blendEnable = VK_FALSE;
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &blendAttachment;
+
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &lightSetLayout_;
+    VK_CHECK(vkCreatePipelineLayout(device_.handle(), &layoutInfo, nullptr, &lightPipelineLayout_));
+
+    VkGraphicsPipelineCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    ci.stageCount = static_cast<uint32_t>(stages.size());
+    ci.pStages = stages.data();
+    ci.pVertexInputState = &vertexInput;
+    ci.pInputAssemblyState = &inputAssembly;
+    ci.pViewportState = &viewportState;
+    ci.pRasterizationState = &rasterizer;
+    ci.pMultisampleState = &multisampling;
+    ci.pDepthStencilState = &depthStencil;
+    ci.pColorBlendState = &colorBlend;
+    ci.pDynamicState = &dynamicState;
+    ci.layout = lightPipelineLayout_;
+    ci.renderPass = lightRenderPass_;
+    ci.subpass = 0;
+    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE, 1, &ci, nullptr,
+                                       &lightPipeline_));
 
     vkDestroyShaderModule(device_.handle(), frag, nullptr);
     vkDestroyShaderModule(device_.handle(), vert, nullptr);
@@ -574,28 +739,52 @@ void Renderer::createShadowPipeline() {
     vkDestroyShaderModule(device_.handle(), vert, nullptr);
 }
 
-void Renderer::createDepthResources() {
+void Renderer::createGBuffers() {
     const VkExtent2D extent = swapchain_.extent();
-    depthImage_ = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
-                        depthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                        VK_IMAGE_ASPECT_DEPTH_BIT);
+    const VkImageUsageFlags colorUsage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
+    for (GBuffer& gb : gbuffers_) {
+        gb.position = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
+                            kGPositionFormat, colorUsage, VK_IMAGE_ASPECT_COLOR_BIT);
+        gb.normal = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
+                          kGNormalFormat, colorUsage, VK_IMAGE_ASPECT_COLOR_BIT);
+        gb.albedo = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
+                          kGAlbedoFormat, colorUsage, VK_IMAGE_ASPECT_COLOR_BIT);
+        gb.emissive = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
+                            kGEmissiveFormat, colorUsage, VK_IMAGE_ASPECT_COLOR_BIT);
+        gb.depth = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
+                         depthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        const std::array<VkImageView, kGBufferCount + 1> attachments = {
+            gb.position.view(), gb.normal.view(), gb.albedo.view(), gb.emissive.view(),
+            gb.depth.view()};
+        VkFramebufferCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        ci.renderPass = geomRenderPass_;
+        ci.attachmentCount = static_cast<uint32_t>(attachments.size());
+        ci.pAttachments = attachments.data();
+        ci.width = extent.width;
+        ci.height = extent.height;
+        ci.layers = 1;
+        VK_CHECK(vkCreateFramebuffer(device_.handle(), &ci, nullptr, &gb.framebuffer));
+    }
 }
 
 void Renderer::createFramebuffers() {
+    // Swapchain framebuffers for the lighting pass (color only).
     const auto& views = swapchain_.imageViews();
     framebuffers_.resize(views.size());
     const VkExtent2D extent = swapchain_.extent();
 
     for (size_t i = 0; i < views.size(); ++i) {
-        // Attachment order must match the render pass: color first, depth second. The depth
-        // view is shared across all framebuffers (only one frame renders at a time per image).
-        const std::array<VkImageView, 2> attachments = {views[i], depthImage_.view()};
-
+        VkImageView attachment = views[i];
         VkFramebufferCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        ci.renderPass = renderPass_;
-        ci.attachmentCount = static_cast<uint32_t>(attachments.size());
-        ci.pAttachments = attachments.data();
+        ci.renderPass = lightRenderPass_;
+        ci.attachmentCount = 1;
+        ci.pAttachments = &attachment;
         ci.width = extent.width;
         ci.height = extent.height;
         ci.layers = 1;
@@ -797,234 +986,124 @@ void Renderer::createUniformBuffers() {
 }
 
 void Renderer::createDescriptorPool() {
+    // Geometry sets: UBO + kTextureCount samplers each. Lighting sets: UBO + (4 G-buffer + shadow
+    // + 3 IBL + environment) = 9 samplers each. Two sets of each per frame.
+    constexpr int kLightImages = kGBufferCount + 1 + kIblTextureCount + 1;
     std::array<VkDescriptorPoolSize, 2> sizes{};
     sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[0].descriptorCount = kFramesInFlight;
+    sizes[0].descriptorCount = 2 * kFramesInFlight;
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount =
-        kFramesInFlight * (kTextureCount + kIblTextureCount + 1); // material + IBL + shadow
+    sizes[1].descriptorCount = kFramesInFlight * (kTextureCount + kLightImages);
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ci.poolSizeCount = static_cast<uint32_t>(sizes.size());
     ci.pPoolSizes = sizes.data();
-    ci.maxSets = kFramesInFlight;
+    ci.maxSets = 2 * kFramesInFlight;
     VK_CHECK(vkCreateDescriptorPool(device_.handle(), &ci, nullptr, &descriptorPool_));
 }
 
-void Renderer::createDescriptorSets() {
-    const std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, descriptorSetLayout_);
-
+void Renderer::createGeomDescriptors() {
+    const std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, geomSetLayout_);
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = descriptorPool_;
     allocInfo.descriptorSetCount = kFramesInFlight;
     allocInfo.pSetLayouts = layouts.data();
-
-    descriptorSets_.resize(kFramesInFlight);
-    VK_CHECK(vkAllocateDescriptorSets(device_.handle(), &allocInfo, descriptorSets_.data()));
+    geomDescriptorSets_.resize(kFramesInFlight);
+    VK_CHECK(vkAllocateDescriptorSets(device_.handle(), &allocInfo, geomDescriptorSets_.data()));
 
     for (int i = 0; i < kFramesInFlight; ++i) {
         VkDescriptorBufferInfo bufferInfo{};
         bufferInfo.buffer = uniformBuffers_[i].handle();
-        bufferInfo.offset = 0;
         bufferInfo.range = sizeof(CameraUBO);
 
-        constexpr int kImageBindings = kTextureCount + kIblTextureCount + 1;
-        std::array<VkDescriptorImageInfo, kImageBindings> imageInfos{};
+        std::array<VkDescriptorImageInfo, kTextureCount> imageInfos{};
         for (int t = 0; t < kTextureCount; ++t) {
-            imageInfos[t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            imageInfos[t].imageView = textures_[t].view();
-            imageInfos[t].sampler = sampler_;
+            imageInfos[t] = {sampler_, textures_[t].view(),
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         }
-        // Bindings 6, 7, 8: irradiance, prefilter (env sampler), BRDF LUT (clamp sampler).
-        imageInfos[5] = {ibl_->environmentSampler(), ibl_->irradianceView(),
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        imageInfos[6] = {ibl_->environmentSampler(), ibl_->prefilterView(),
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        imageInfos[7] = {ibl_->lutSampler(), ibl_->brdfLutView(),
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        // Binding 9: this frame's shadow map (in depth read-only layout after the shadow pass).
-        imageInfos[8] = {shadowSampler_, shadowMaps_[i].view(),
-                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
 
-        std::array<VkWriteDescriptorSet, 1 + kImageBindings> writes{};
+        std::array<VkWriteDescriptorSet, 1 + kTextureCount> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = descriptorSets_[i];
+        writes[0].dstSet = geomDescriptorSets_[i];
         writes[0].dstBinding = 0;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         writes[0].descriptorCount = 1;
         writes[0].pBufferInfo = &bufferInfo;
-
-        for (int t = 0; t < kImageBindings; ++t) {
+        for (int t = 0; t < kTextureCount; ++t) {
             writes[t + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[t + 1].dstSet = descriptorSets_[i];
+            writes[t + 1].dstSet = geomDescriptorSets_[i];
             writes[t + 1].dstBinding = static_cast<uint32_t>(t + 1);
             writes[t + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[t + 1].descriptorCount = 1;
             writes[t + 1].pImageInfo = &imageInfos[t];
         }
-
         vkUpdateDescriptorSets(device_.handle(), static_cast<uint32_t>(writes.size()),
                                writes.data(), 0, nullptr);
     }
 }
 
-void Renderer::createSkyboxPipeline() {
-    // Set 0: camera UBO (binding 0) + environment map (binding 1).
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+void Renderer::createLightDescriptors() {
+    // Point sampling with edge clamp for the G-buffer (no blending across geometry edges).
+    VkSamplerCreateInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = VK_FILTER_NEAREST;
+    si.minFilter = VK_FILTER_NEAREST;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK_CHECK(vkCreateSampler(device_.handle(), &si, nullptr, &gbufferSampler_));
 
-    VkDescriptorSetLayoutCreateInfo slci{};
-    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = static_cast<uint32_t>(bindings.size());
-    slci.pBindings = bindings.data();
-    VK_CHECK(vkCreateDescriptorSetLayout(device_.handle(), &slci, nullptr, &skyboxSetLayout_));
-
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts = &skyboxSetLayout_;
-    VK_CHECK(vkCreatePipelineLayout(device_.handle(), &plci, nullptr, &skyboxPipelineLayout_));
-
-    VkShaderModule vert = loadShaderModule("skybox.vert.spv");
-    VkShaderModule frag = loadShaderModule("skybox.frag.spv");
-
-    VkPipelineShaderStageCreateInfo vertStage{};
-    vertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-    vertStage.module = vert;
-    vertStage.pName = "main";
-    VkPipelineShaderStageCreateInfo fragStage{};
-    fragStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    fragStage.module = frag;
-    fragStage.pName = "main";
-    const std::array<VkPipelineShaderStageCreateInfo, 2> stages = {vertStage, fragStage};
-
-    // No vertex input: the skybox is a shader-generated fullscreen triangle.
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
-    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    const std::array<VkDynamicState, 2> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
-                                                         VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamicState{};
-    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
-    dynamicState.pDynamicStates = dynamicStates.data();
-
-    VkPipelineViewportStateCreateInfo viewportState{};
-    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewportState.viewportCount = 1;
-    viewportState.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rasterizer{};
-    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisampling{};
-    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    // Draw at the far plane; keep it behind anything already in the depth buffer, don't write depth.
-    VkPipelineDepthStencilStateCreateInfo depthStencil{};
-    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depthStencil.depthTestEnable = VK_TRUE;
-    depthStencil.depthWriteEnable = VK_FALSE;
-    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blendAttachment.blendEnable = VK_FALSE;
-    VkPipelineColorBlendStateCreateInfo colorBlend{};
-    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlend.attachmentCount = 1;
-    colorBlend.pAttachments = &blendAttachment;
-
-    VkGraphicsPipelineCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    ci.stageCount = static_cast<uint32_t>(stages.size());
-    ci.pStages = stages.data();
-    ci.pVertexInputState = &vertexInput;
-    ci.pInputAssemblyState = &inputAssembly;
-    ci.pViewportState = &viewportState;
-    ci.pRasterizationState = &rasterizer;
-    ci.pMultisampleState = &multisampling;
-    ci.pDepthStencilState = &depthStencil;
-    ci.pColorBlendState = &colorBlend;
-    ci.pDynamicState = &dynamicState;
-    ci.layout = skyboxPipelineLayout_;
-    ci.renderPass = renderPass_;
-    ci.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE, 1, &ci, nullptr,
-                                       &skyboxPipeline_));
-
-    vkDestroyShaderModule(device_.handle(), frag, nullptr);
-    vkDestroyShaderModule(device_.handle(), vert, nullptr);
-}
-
-void Renderer::createSkyboxDescriptors() {
-    std::array<VkDescriptorPoolSize, 2> sizes{};
-    sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[0].descriptorCount = kFramesInFlight;
-    sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = kFramesInFlight;
-
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.poolSizeCount = static_cast<uint32_t>(sizes.size());
-    pci.pPoolSizes = sizes.data();
-    pci.maxSets = kFramesInFlight;
-    VK_CHECK(vkCreateDescriptorPool(device_.handle(), &pci, nullptr, &skyboxDescriptorPool_));
-
-    const std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, skyboxSetLayout_);
+    const std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, lightSetLayout_);
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = skyboxDescriptorPool_;
+    allocInfo.descriptorPool = descriptorPool_;
     allocInfo.descriptorSetCount = kFramesInFlight;
     allocInfo.pSetLayouts = layouts.data();
-    skyboxDescriptorSets_.resize(kFramesInFlight);
-    VK_CHECK(vkAllocateDescriptorSets(device_.handle(), &allocInfo, skyboxDescriptorSets_.data()));
+    lightDescriptorSets_.resize(kFramesInFlight);
+    VK_CHECK(vkAllocateDescriptorSets(device_.handle(), &allocInfo, lightDescriptorSets_.data()));
 
+    writeLightDescriptors();
+}
+
+void Renderer::writeLightDescriptors() {
     for (int i = 0; i < kFramesInFlight; ++i) {
         VkDescriptorBufferInfo bufferInfo{};
         bufferInfo.buffer = uniformBuffers_[i].handle();
-        bufferInfo.offset = 0;
         bufferInfo.range = sizeof(CameraUBO);
 
-        VkDescriptorImageInfo envInfo{};
-        envInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        envInfo.imageView = ibl_->environmentView();
-        envInfo.sampler = ibl_->environmentSampler();
+        constexpr int kImageBindings = kGBufferCount + 1 + kIblTextureCount + 1;
+        constexpr VkImageLayout kRO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        const GBuffer& gb = gbuffers_[i];
+        std::array<VkDescriptorImageInfo, kImageBindings> imageInfos = {{
+            {gbufferSampler_, gb.position.view(), kRO},
+            {gbufferSampler_, gb.normal.view(), kRO},
+            {gbufferSampler_, gb.albedo.view(), kRO},
+            {gbufferSampler_, gb.emissive.view(), kRO},
+            {shadowSampler_, shadowMaps_[i].view(), VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
+            {ibl_->environmentSampler(), ibl_->irradianceView(), kRO},
+            {ibl_->environmentSampler(), ibl_->prefilterView(), kRO},
+            {ibl_->lutSampler(), ibl_->brdfLutView(), kRO},
+            {ibl_->environmentSampler(), ibl_->environmentView(), kRO},
+        }};
 
-        std::array<VkWriteDescriptorSet, 2> writes{};
+        std::array<VkWriteDescriptorSet, 1 + kImageBindings> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = skyboxDescriptorSets_[i];
+        writes[0].dstSet = lightDescriptorSets_[i];
         writes[0].dstBinding = 0;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         writes[0].descriptorCount = 1;
         writes[0].pBufferInfo = &bufferInfo;
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = skyboxDescriptorSets_[i];
-        writes[1].dstBinding = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].descriptorCount = 1;
-        writes[1].pImageInfo = &envInfo;
+        for (int t = 0; t < kImageBindings; ++t) {
+            writes[t + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[t + 1].dstSet = lightDescriptorSets_[i];
+            writes[t + 1].dstBinding = static_cast<uint32_t>(t + 1);
+            writes[t + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[t + 1].descriptorCount = 1;
+            writes[t + 1].pImageInfo = &imageInfos[t];
+        }
         vkUpdateDescriptorSets(device_.handle(), static_cast<uint32_t>(writes.size()),
                                writes.data(), 0, nullptr);
     }
@@ -1105,24 +1184,23 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     vkCmdDrawIndexed(cmd, groundIndexCount_, 1, 0, 0, 0);
     vkCmdEndRenderPass(cmd);
 
-    // --- Main pass: shade the scene, sampling the shadow map just written. ---
-    std::array<VkClearValue, 2> clears{};
-    clears[0].color = {{0.01f, 0.01f, 0.015f, 1.0f}};
-    clears[1].depthStencil = {1.0f, 0};
+    // --- Geometry pass: fill this frame's G-buffer with surface attributes. ---
+    std::array<VkClearValue, kGBufferCount + 1> geomClears{};
+    geomClears[kGBufferCount].depthStencil = {1.0f, 0}; // color targets clear to zero
 
-    VkRenderPassBeginInfo rpBegin{};
-    rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpBegin.renderPass = renderPass_;
-    rpBegin.framebuffer = framebuffers_[imageIndex];
-    rpBegin.renderArea.extent = extent;
-    rpBegin.clearValueCount = static_cast<uint32_t>(clears.size());
-    rpBegin.pClearValues = clears.data();
+    VkRenderPassBeginInfo geomBegin{};
+    geomBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    geomBegin.renderPass = geomRenderPass_;
+    geomBegin.framebuffer = gbuffers_[currentFrame_].framebuffer;
+    geomBegin.renderArea.extent = extent;
+    geomBegin.clearValueCount = static_cast<uint32_t>(geomClears.size());
+    geomBegin.pClearValues = geomClears.data();
 
-    vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    vkCmdBeginRenderPass(cmd, &geomBegin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, geomPipeline_);
     setViewportScissor(extent.width, extent.height);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
-                            &descriptorSets_[currentFrame_], 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, geomPipelineLayout_, 0, 1,
+                            &geomDescriptorSets_[currentFrame_], 0, nullptr);
 
     auto drawObject = [&](const glm::mat4& model, const MaterialPush& mat, const Buffer& vb,
                           const Buffer& ib, uint32_t indexCount) {
@@ -1132,7 +1210,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
         push.emissiveFactor = mat.emissiveFactor;
         push.metallicFactor = mat.metallicFactor;
         push.roughnessFactor = mat.roughnessFactor;
-        vkCmdPushConstants(cmd, pipelineLayout_,
+        vkCmdPushConstants(cmd, geomPipelineLayout_,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(MeshPush), &push);
         bindMesh(vb, ib);
@@ -1142,15 +1220,24 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     drawObject(meshModel_, material_, vertexBuffer_, indexBuffer_, indexCount_);
     drawObject(groundModel_, groundMaterial_, groundVertexBuffer_, groundIndexBuffer_,
                groundIndexCount_);
-
-    // Skybox last: it fills only the background (depth test LESS_OR_EQUAL vs the cleared far
-    // plane), so it never overdraws the scene but avoids shading pixels already covered.
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipeline_);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipelineLayout_, 0, 1,
-                            &skyboxDescriptorSets_[currentFrame_], 0, nullptr);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-
     vkCmdEndRenderPass(cmd);
+
+    // --- Lighting pass: fullscreen shading, sampling the G-buffer + shadow + IBL. ---
+    VkRenderPassBeginInfo lightBegin{};
+    lightBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    lightBegin.renderPass = lightRenderPass_;
+    lightBegin.framebuffer = framebuffers_[imageIndex];
+    lightBegin.renderArea.extent = extent;
+    lightBegin.clearValueCount = 0;
+
+    vkCmdBeginRenderPass(cmd, &lightBegin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lightPipeline_);
+    setViewportScissor(extent.width, extent.height);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lightPipelineLayout_, 0, 1,
+                            &lightDescriptorSets_[currentFrame_], 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cmd);
+
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
 
@@ -1208,10 +1295,15 @@ void Renderer::recreateSwapchain() {
         vkDestroyFramebuffer(device_.handle(), fb, nullptr);
     }
     framebuffers_.clear();
+    for (GBuffer& gb : gbuffers_) {
+        vkDestroyFramebuffer(device_.handle(), gb.framebuffer, nullptr);
+        gb.framebuffer = VK_NULL_HANDLE;
+    }
 
     swapchain_.recreate(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
-    createDepthResources(); // depth buffer must match the new extent
+    createGBuffers();          // G-buffer must match the new extent
     createFramebuffers();
+    writeLightDescriptors();   // light sets point at the new G-buffer views
 }
 
 void Renderer::drawFrame() {

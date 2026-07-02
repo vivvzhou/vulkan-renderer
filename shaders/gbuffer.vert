@@ -1,15 +1,15 @@
 #version 450
 
-// Per-frame camera + light state. The per-object model matrix arrives via push constants so a
-// single UBO/pipeline can draw multiple objects (the mesh and the ground plane).
+// Geometry pass vertex stage: transform to clip space and pass world-space attributes to the
+// G-buffer fragment stage. Per-object model comes via push constants.
 layout(binding = 0) uniform CameraUBO {
     mat4 view;
     mat4 proj;
-    vec4 camPos;    // world-space eye position (xyz)
-    vec4 iblParams; // x = prefilter max LOD
+    vec4 camPos;
+    vec4 iblParams;
     mat4 lightSpace;
-    vec4 lightDir;   // directional light travel direction (xyz)
-    vec4 lightColor; // rgb intensity
+    vec4 lightDir;
+    vec4 lightColor;
 } cam;
 
 layout(push_constant) uniform PushConstants {
