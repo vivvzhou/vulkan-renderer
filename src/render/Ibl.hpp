@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vk/vma.hpp"
+#include "vk/DeviceAllocator.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -15,7 +15,7 @@
 // Everything is generated once at construction via compute shaders.
 class Ibl {
 public:
-    Ibl(VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+    Ibl(VkDevice device, DeviceAllocator& allocator, VkQueue queue, VkCommandPool pool,
         const std::string& hdrPath);
     ~Ibl();
 
@@ -33,7 +33,7 @@ public:
 private:
     struct Tex {
         VkImage image = VK_NULL_HANDLE;
-        VmaAllocation alloc = nullptr;
+        DeviceAllocator::Allocation alloc{};
         VkImageView view = VK_NULL_HANDLE; // full-mip sampling view
     };
 
@@ -49,7 +49,7 @@ private:
     void computeBrdf();
 
     VkDevice device_;
-    VmaAllocator allocator_;
+    DeviceAllocator& allocator_;
     VkQueue queue_;
     VkCommandPool pool_;
 

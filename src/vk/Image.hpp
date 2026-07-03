@@ -1,15 +1,16 @@
 #pragma once
 
-#include "vk/vma.hpp"
+#include "vk/DeviceAllocator.hpp"
 
-// RAII wrapper around a VkImage + its VMA allocation + a matching VkImageView. Move-only.
-// Used for both the depth buffer and sampled textures; the caller picks the format, usage,
-// and aspect mask (color vs depth).
+#include <vulkan/vulkan.h>
+
+// RAII wrapper around a VkImage (optimal tiling), its DeviceAllocator sub-allocation, and a
+// matching VkImageView. Move-only. Used for the depth buffer, G-buffer targets, and textures.
 class Image {
 public:
     Image() = default;
-    Image(VmaAllocator allocator, VkDevice device, uint32_t width, uint32_t height,
-          VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect);
+    Image(DeviceAllocator& allocator, uint32_t width, uint32_t height, VkFormat format,
+          VkImageUsageFlags usage, VkImageAspectFlags aspect);
     ~Image();
 
     Image(Image&& other) noexcept;
@@ -24,10 +25,9 @@ public:
 private:
     void reset();
 
-    VmaAllocator allocator_ = nullptr;
-    VkDevice device_ = VK_NULL_HANDLE;
+    DeviceAllocator* allocator_ = nullptr;
     VkImage image_ = VK_NULL_HANDLE;
-    VmaAllocation allocation_ = nullptr;
+    DeviceAllocator::Allocation allocation_{};
     VkImageView view_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
 };

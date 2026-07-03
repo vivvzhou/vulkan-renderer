@@ -6,8 +6,8 @@
 
 #include "core/Window.hpp"
 #include "render/Renderer.hpp"
-#include "vk/Allocator.hpp"
 #include "vk/Device.hpp"
+#include "vk/DeviceAllocator.hpp"
 #include "vk/Instance.hpp"
 #include "vk/Surface.hpp"
 #include "vk/Swapchain.hpp"
@@ -33,7 +33,7 @@ int main() {
         Instance instance(kEnableValidation);
         Surface surface(instance.handle(), window);
         Device device(instance.handle(), surface.handle(), instance.validationEnabled());
-        Allocator allocator(instance.handle(), device.physical(), device.handle());
+        DeviceAllocator allocator(device.physical(), device.handle());
 
         int fbWidth = 0;
         int fbHeight = 0;

@@ -1,5 +1,6 @@
 #include "render/Ibl.hpp"
 
+#include "vk/Buffer.hpp"
 #include "vk/Common.hpp"
 
 // stb_image's implementation is compiled in GltfLoader.cpp; here we only need the declarations.
@@ -57,7 +58,7 @@ uint32_t groups(uint32_t n) { return (n + 7) / 8; } // 8x8 compute local size
 
 } // namespace
 
-Ibl::Ibl(VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+Ibl::Ibl(VkDevice device, DeviceAllocator& allocator, VkQueue queue, VkCommandPool pool,
          const std::string& hdrPath)
     : device_(device), allocator_(allocator), queue_(queue), pool_(pool) {
     // Equirectangular maps wrap horizontally (longitude) and clamp vertically (latitude).
@@ -92,7 +93,8 @@ Ibl::~Ibl() {
             vkDestroyImageView(device_, t->view, nullptr);
         }
         if (t->image != VK_NULL_HANDLE) {
-            vmaDestroyImage(allocator_, t->image, t->alloc);
+            vkDestroyImage(device_, t->image, nullptr);
+            allocator_.free(t->alloc);
         }
     }
     if (envSampler_ != VK_NULL_HANDLE) {
@@ -118,11 +120,12 @@ Ibl::Tex Ibl::createTex(uint32_t width, uint32_t height, uint32_t mips, VkFormat
     ici.usage = usage;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateImage(device_, &ici, nullptr, &tex.image));
 
-    VmaAllocationCreateInfo aci{};
-    aci.usage = VMA_MEMORY_USAGE_AUTO;
-    aci.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-    VK_CHECK(vmaCreateImage(allocator_, &ici, &aci, &tex.image, &tex.alloc, nullptr));
+    VkMemoryRequirements reqs{};
+    vkGetImageMemoryRequirements(device_, tex.image, &reqs);
+    tex.alloc = allocator_.allocate(reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, /*linear=*/false);
+    VK_CHECK(vkBindImageMemory(device_, tex.image, tex.alloc.memory, tex.alloc.offset));
 
     tex.view = createView(tex.image, format, 0, mips);
     return tex;
@@ -192,20 +195,9 @@ void Ibl::loadEnvironment(const std::string& hdrPath) {
     }
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 4 * sizeof(float);
 
-    VkBufferCreateInfo bci{};
-    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VmaAllocationCreateInfo saci{};
-    saci.usage = VMA_MEMORY_USAGE_AUTO;
-    saci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                 VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    VkBuffer staging = VK_NULL_HANDLE;
-    VmaAllocation stagingAlloc = nullptr;
-    VmaAllocationInfo stagingInfo{};
-    VK_CHECK(vmaCreateBuffer(allocator_, &bci, &saci, &staging, &stagingAlloc, &stagingInfo));
-    std::memcpy(stagingInfo.pMappedData, data, static_cast<size_t>(bytes));
+    Buffer staging(allocator_, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::memcpy(staging.mapped(), data, static_cast<size_t>(bytes));
     stbi_image_free(data);
 
     env_ = createTex(static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1,
@@ -221,16 +213,14 @@ void Ibl::loadEnvironment(const std::string& hdrPath) {
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.layerCount = 1;
         copy.imageExtent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1};
-        vkCmdCopyBufferToImage(cmd, staging, env_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                               &copy);
+        vkCmdCopyBufferToImage(cmd, staging.handle(), env_.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
         transition(cmd, env_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_ACCESS_SHADER_READ_BIT, 0, 1);
     });
-
-    vmaDestroyBuffer(allocator_, staging, stagingAlloc);
 }
 
 void Ibl::computeIrradiance() {

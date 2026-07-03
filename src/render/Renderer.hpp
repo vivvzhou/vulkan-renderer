@@ -17,7 +17,7 @@
 class Window;
 class Device;
 class Swapchain;
-class Allocator;
+class DeviceAllocator;
 class Ibl;
 struct MeshData;
 struct TextureData;
@@ -27,7 +27,7 @@ struct TextureData;
 // pass that reads the G-buffer and shades with the shadowed directional light plus IBL.
 class Renderer {
 public:
-    Renderer(Window& window, Device& device, Allocator& allocator, Swapchain& swapchain);
+    Renderer(Window& window, Device& device, DeviceAllocator& allocator, Swapchain& swapchain);
     ~Renderer();
 
     Renderer(const Renderer&) = delete;
@@ -81,7 +81,7 @@ private:
 
     Window& window_;
     Device& device_;
-    Allocator& allocator_;
+    DeviceAllocator& allocator_;
     Swapchain& swapchain_;
 
     VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;

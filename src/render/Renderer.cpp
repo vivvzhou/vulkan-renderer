@@ -4,8 +4,8 @@
 #include "render/GltfLoader.hpp"
 #include "render/Ibl.hpp"
 #include "render/Vertex.hpp"
-#include "vk/Allocator.hpp"
 #include "vk/Common.hpp"
+#include "vk/DeviceAllocator.hpp"
 #include "vk/Device.hpp"
 #include "vk/Swapchain.hpp"
 
@@ -83,7 +83,7 @@ std::vector<char> readFile(const std::string& path) {
 
 } // namespace
 
-Renderer::Renderer(Window& window, Device& device, Allocator& allocator, Swapchain& swapchain)
+Renderer::Renderer(Window& window, Device& device, DeviceAllocator& allocator, Swapchain& swapchain)
     : window_(window), device_(device), allocator_(allocator), swapchain_(swapchain) {
     const MeshData model = loadGltf(ASSET_PATH);
     modelCenter_ = model.center;
@@ -393,8 +393,7 @@ void Renderer::createShadowResources() {
     VK_CHECK(vkCreateRenderPass(device_.handle(), &rpci, nullptr, &shadowRenderPass_));
 
     for (int i = 0; i < kFramesInFlight; ++i) {
-        shadowMaps_[i] = Image(allocator_.handle(), device_.handle(), kShadowMapSize,
-                               kShadowMapSize, depthFormat_,
+        shadowMaps_[i] = Image(allocator_, kShadowMapSize, kShadowMapSize, depthFormat_,
                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                                    VK_IMAGE_USAGE_SAMPLED_BIT,
                                VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -760,17 +759,16 @@ void Renderer::createGBuffers() {
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 
     for (GBuffer& gb : gbuffers_) {
-        gb.position = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
-                            kGPositionFormat, colorUsage, VK_IMAGE_ASPECT_COLOR_BIT);
-        gb.normal = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
-                          kGNormalFormat, colorUsage, VK_IMAGE_ASPECT_COLOR_BIT);
-        gb.albedo = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
-                          kGAlbedoFormat, colorUsage, VK_IMAGE_ASPECT_COLOR_BIT);
-        gb.emissive = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
-                            kGEmissiveFormat, colorUsage, VK_IMAGE_ASPECT_COLOR_BIT);
-        gb.depth = Image(allocator_.handle(), device_.handle(), extent.width, extent.height,
-                         depthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                         VK_IMAGE_ASPECT_DEPTH_BIT);
+        gb.position = Image(allocator_, extent.width, extent.height, kGPositionFormat, colorUsage,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+        gb.normal = Image(allocator_, extent.width, extent.height, kGNormalFormat, colorUsage,
+                          VK_IMAGE_ASPECT_COLOR_BIT);
+        gb.albedo = Image(allocator_, extent.width, extent.height, kGAlbedoFormat, colorUsage,
+                          VK_IMAGE_ASPECT_COLOR_BIT);
+        gb.emissive = Image(allocator_, extent.width, extent.height, kGEmissiveFormat, colorUsage,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+        gb.depth = Image(allocator_, extent.width, extent.height, depthFormat_,
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
 
         const std::array<VkImageView, kGBufferCount + 1> attachments = {
             gb.position.view(), gb.normal.view(), gb.albedo.view(), gb.emissive.view(),
@@ -845,7 +843,7 @@ void Renderer::createThreadResources() {
 
 void Renderer::createIbl() {
     // Precompute irradiance / prefilter / BRDF LUT from the HDR environment (uses commandPool_).
-    ibl_ = std::make_unique<Ibl>(device_.handle(), allocator_.handle(), device_.graphicsQueue(),
+    ibl_ = std::make_unique<Ibl>(device_.handle(), allocator_, device_.graphicsQueue(),
                                  commandPool_, ENV_HDR_PATH);
 }
 
@@ -886,14 +884,12 @@ void Renderer::immediateSubmit(const std::function<void(VkCommandBuffer)>& recor
 Buffer Renderer::createDeviceLocalBuffer(const void* data, VkDeviceSize size,
                                          VkBufferUsageFlags usage) {
     // Staging buffer: host-visible, we memcpy into it, then copy to a device-local buffer.
-    Buffer staging(allocator_.handle(), size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                   VMA_MEMORY_USAGE_AUTO,
-                   VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                       VMA_ALLOCATION_CREATE_MAPPED_BIT);
+    Buffer staging(allocator_, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     std::memcpy(staging.mapped(), data, static_cast<size_t>(size));
 
-    Buffer result(allocator_.handle(), size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | usage,
-                  VMA_MEMORY_USAGE_AUTO);
+    Buffer result(allocator_, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | usage,
+                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     immediateSubmit([&](VkCommandBuffer cmd) {
         VkBufferCopy copy{};
@@ -906,13 +902,11 @@ Buffer Renderer::createDeviceLocalBuffer(const void* data, VkDeviceSize size,
 Image Renderer::uploadTexture(const TextureData& tex, VkFormat format) {
     const VkDeviceSize imageBytes = tex.pixels.size();
 
-    Buffer staging(allocator_.handle(), imageBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                   VMA_MEMORY_USAGE_AUTO,
-                   VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                       VMA_ALLOCATION_CREATE_MAPPED_BIT);
+    Buffer staging(allocator_, imageBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     std::memcpy(staging.mapped(), tex.pixels.data(), static_cast<size_t>(imageBytes));
 
-    Image image(allocator_.handle(), device_.handle(), tex.width, tex.height, format,
+    Image image(allocator_, tex.width, tex.height, format,
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                 VK_IMAGE_ASPECT_COLOR_BIT);
 
@@ -1013,10 +1007,10 @@ void Renderer::createUniformBuffers() {
     for (int i = 0; i < kFramesInFlight; ++i) {
         // Host-visible + persistently mapped: we overwrite it from the CPU every frame, so
         // there's no benefit to device-local memory or a staging copy here.
-        uniformBuffers_.emplace_back(allocator_.handle(), sizeof(CameraUBO),
-                                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
-                                     VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                                         VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        uniformBuffers_.emplace_back(allocator_, sizeof(CameraUBO),
+                                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
 }
 

@@ -44,12 +44,6 @@ FetchContent_Declare(glm
   GIT_TAG        1.0.1
   GIT_SHALLOW    TRUE)
 
-FetchContent_Declare(vma
-  GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
-  GIT_TAG        v3.1.0
-  GIT_SHALLOW    TRUE
-  SOURCE_SUBDIR  __skip_cmake__)
-
 FetchContent_Declare(stb
   GIT_REPOSITORY https://github.com/nothings/stb.git
   GIT_TAG        master)
@@ -60,7 +54,7 @@ FetchContent_Declare(tinygltf
   GIT_SHALLOW    TRUE
   SOURCE_SUBDIR  __skip_cmake__)
 
-FetchContent_MakeAvailable(glfw glm vma stb tinygltf)
+FetchContent_MakeAvailable(glfw glm stb tinygltf)
 
 # Sample model (single binary asset, downloaded but not extracted). Not committed to the repo.
 FetchContent_Declare(damagedhelmet
@@ -78,9 +72,6 @@ FetchContent_Declare(envhdr
 FetchContent_MakeAvailable(envhdr)
 set(ENV_HDR_PATH "${envhdr_SOURCE_DIR}/${ENV_HDR_NAME}")
 message(STATUS "Env HDR asset : ${ENV_HDR_PATH}")
-
-add_library(vma INTERFACE)
-target_include_directories(vma INTERFACE ${vma_SOURCE_DIR}/include)
 
 add_library(stb INTERFACE)
 target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})
@@ -103,10 +94,9 @@ add_executable(vkrenderer
   src/vk/Instance.cpp
   src/vk/Device.cpp
   src/vk/Swapchain.cpp
-  src/vk/Allocator.cpp
+  src/vk/DeviceAllocator.cpp
   src/vk/Buffer.cpp
   src/vk/Image.cpp
-  src/vk/VmaImpl.cpp
   src/render/GltfLoader.cpp
   src/render/Ibl.cpp
   src/render/Renderer.cpp)
@@ -117,7 +107,6 @@ target_link_libraries(vkrenderer PRIVATE
   Vulkan::Vulkan
   glfw
   glm::glm
-  vma
   stb
   tinygltf)
 

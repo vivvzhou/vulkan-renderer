@@ -19,7 +19,7 @@ Built incrementally in phases — each one a runnable milestone:
 - [x] **Phase 4** — shadow mapping
 - [x] **Phase 5** — deferred G-buffer
 - [x] **Phase 6** — multithreaded secondary command buffers
-- [ ] **Phase 7** — custom `VkDeviceMemory` allocator
+- [x] **Phase 7** — custom `VkDeviceMemory` allocator
 - [ ] **Phase 8** — pipeline cache + GPU timestamp profiling
 - [ ] **Phase 9** — neural ambient occlusion (offline-trained MLP, GLSL compute inference)
 - [ ] **Phase 10** — portfolio polish
@@ -27,7 +27,8 @@ Built incrementally in phases — each one a runnable milestone:
 ## Build
 
 Requires the [Vulkan SDK](https://vulkan.lunarg.com), CMake ≥ 3.24, and a C++20 compiler.
-Third-party dependencies (GLFW, GLM, VMA, stb, tinygltf) are fetched automatically by CMake.
+Third-party dependencies (GLFW, GLM, stb, tinygltf) are fetched automatically by CMake.
+GPU memory is managed by a hand-written allocator (Phase 7); VMA was the Phase 2 reference.
 
 ```sh
 cmake -S . -B build
