@@ -5,7 +5,7 @@ abstraction layer hiding the driver. It implements a full deferred PBR pipeline,
 lighting, shadow mapping, multithreaded command recording, a hand-written GPU memory allocator,
 and a **neural** (compute-shader MLP) ambient-occlusion pass.
 
-![The renderer: two PBR meshes lit by image-based lighting with shadows, and a live GPU per-pass timing readout in the title bar](docs/images/hero.png)
+![The renderer: a PBR car in a dark garage, lit by a directional key light with image-based reflections and a shadow, and a live GPU per-pass timing readout in the title bar](docs/images/hero.png)
 
 > Built as a deep dive into the systems that underlie GPU drivers: explicit memory management,
 > synchronization, queue submission, SPIR-V, and pipeline-cache serialization — plus an ML
@@ -32,10 +32,15 @@ Loads glTF models (tinygltf) and HDR environments (stb) fetched automatically at
 
 ## What you're seeing
 
-Two spinning [DamagedHelmet](https://github.com/KhronosGroup/glTF-Sample-Assets) meshes on a
-ground plane, lit by an HDR environment (reflections + ambient) and a shadow-casting directional
-light, with neural AO darkening the contact and crease regions. The title bar shows measured GPU
-time per pass, e.g. `shadow 0.03  geom 0.18  neuralAO 1.25  light 0.07  total 1.5 ms`.
+A [ToyCar](https://github.com/KhronosGroup/glTF-Sample-Assets) glTF model spinning on a dark,
+glossy floor in a workshop environment. The scene is deliberately dark: the environment lighting
+is dimmed and the visible background darkened, so the car is shaped by a bright directional key
+light while still catching the environment as reflections. Neural AO darkens the contact and
+crease regions, and a directional shadow grounds the car. The title bar shows measured GPU time
+per pass, e.g. `shadow 0.05  geom 0.18  neuralAO 1.7  light 0.07  total 2.0 ms`.
+
+The scene is data-driven — point `ASSET_PATH` / `ENV_HDR_PATH` (in `CMakeLists.txt`) at any glTF
+model and HDR environment to change it.
 
 ## Architecture
 

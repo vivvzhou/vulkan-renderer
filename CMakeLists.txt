@@ -57,15 +57,15 @@ FetchContent_Declare(tinygltf
 FetchContent_MakeAvailable(glfw glm stb tinygltf)
 
 # Sample model (single binary asset, downloaded but not extracted). Not committed to the repo.
-FetchContent_Declare(damagedhelmet
-  URL https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb
+FetchContent_Declare(model
+  URL https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb
   DOWNLOAD_NO_EXTRACT TRUE)
-FetchContent_MakeAvailable(damagedhelmet)
-set(ASSET_PATH "${damagedhelmet_SOURCE_DIR}/DamagedHelmet.glb")
+FetchContent_MakeAvailable(model)
+set(ASSET_PATH "${model_SOURCE_DIR}/ToyCar.glb")
 message(STATUS "Model asset   : ${ASSET_PATH}")
 
 # HDR environment map for image-based lighting (CC0, Poly Haven). Not committed.
-set(ENV_HDR_NAME "shanghai_bund_2k.hdr")
+set(ENV_HDR_NAME "autoshop_01_2k.hdr")
 FetchContent_Declare(envhdr
   URL https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/${ENV_HDR_NAME}
   DOWNLOAD_NO_EXTRACT TRUE)

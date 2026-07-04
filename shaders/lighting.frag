@@ -86,9 +86,12 @@ void main() {
     vec4 packedNormal = texture(gNormal, fragUV);
     vec3 N = packedNormal.xyz;
 
-    // Background: the geometry pass cleared the normal to zero here, so show the environment.
+    // Background: the geometry pass cleared the normal to zero here. Keep the environment very
+    // dark on screen (product-shot look) while the object still reflects the full-brightness
+    // environment through IBL below.
     if (dot(N, N) < 0.5) {
-        outColor = vec4(aces(texture(environmentMap, dirToUv(normalize(viewDir))).rgb), 1.0);
+        vec3 bg = texture(environmentMap, dirToUv(normalize(viewDir))).rgb;
+        outColor = vec4(aces(bg * 0.08), 1.0);
         return;
     }
 
@@ -131,7 +134,12 @@ void main() {
     // Neural screen-space AO modulates the (indirect) ambient term along with the baked AO map.
     // The power is an intensity control that deepens contact/crease darkening.
     float ssao = pow(clamp(texture(ssaoMap, fragUV).r, 0.0, 1.0), 2.5);
-    vec3 ambient = (kD * diffuseIBL + specularIBL) * ao * ssao;
+
+    // Dim the environment lighting so the scene reads dark; the object still catches the
+    // environment as reflections and the directional key light does most of the shaping.
+    const float kDiffuseIbl = 0.5;
+    const float kSpecularIbl = 0.9;
+    vec3 ambient = (kD * diffuseIBL * kDiffuseIbl + specularIBL * kSpecularIbl) * ao * ssao;
 
     outColor = vec4(aces(ambient + Lo + emissive), 1.0);
 }

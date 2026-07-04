@@ -36,9 +36,12 @@ struct MeshData {
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
 
-    // Bounding sphere, used to auto-fit the mesh to the camera regardless of its authored scale.
+    // Bounds, used to auto-fit the mesh to the camera and rest it on the ground regardless of
+    // its authored scale.
     glm::vec3 center{0.0f};
     float radius = 1.0f;
+    glm::vec3 aabbMin{0.0f};
+    glm::vec3 aabbMax{0.0f};
 };
 
 // Loads a .glb (or .gltf) file, applying node transforms. Throws std::runtime_error on failure.

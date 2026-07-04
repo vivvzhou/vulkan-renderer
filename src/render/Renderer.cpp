@@ -60,21 +60,22 @@ struct MeshPush {
     float roughnessFactor;
 };
 
-// Fixed eye position; also fed to the fragment shader for the view vector.
-constexpr glm::vec3 kEye = glm::vec3(3.6f, 2.2f, 6.0f);
-constexpr glm::vec3 kLookAt = glm::vec3(0.0f, -0.2f, 0.0f);
+// Fixed eye position; also fed to the fragment shader for the view vector. A low 3/4 angle for
+// a car-hero shot.
+constexpr glm::vec3 kEye = glm::vec3(2.2f, 1.5f, 3.3f);
+constexpr glm::vec3 kLookAt = glm::vec3(0.0f, -0.65f, 0.0f);
 
-// Directional key light: travel direction and radiance. Casts the shadow.
+// Directional key light: travel direction and radiance. Bright so it reads as the key light
+// against the dark, IBL-dimmed backdrop; also casts the shadow.
 constexpr glm::vec3 kLightDir = glm::vec3(-0.5f, -1.0f, -0.4f);
-constexpr glm::vec3 kLightColor = glm::vec3(3.0f);
+constexpr glm::vec3 kLightColor = glm::vec3(4.5f);
 
-constexpr float kGroundY = -1.2f; // ground plane sits just below the fitted meshes
+constexpr float kGroundY = -1.2f; // ground plane sits just below the fitted mesh
 
-// A short row of mesh instances (still partitioned across the recording threads).
-constexpr int kInstanceCount = 2;
+// Mesh instances (still partitioned across the recording threads).
+constexpr int kInstanceCount = 1;
 constexpr float kInstanceSpacing = 2.7f;
 constexpr float kInstanceScale = 1.0f; // fitted mesh radius after scaling
-constexpr float kInstanceY = -0.2f;    // instance center height (rests on the ground)
 
 std::vector<char> readFile(const std::string& path) {
     std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -95,16 +96,18 @@ Renderer::Renderer(Window& window, Device& device, DeviceAllocator& allocator, S
     const MeshData model = loadGltf(ASSET_PATH);
     modelCenter_ = model.center;
     modelRadius_ = model.radius;
+    modelMinY_ = model.aabbMin.y;
     material_.baseColorFactor = model.baseColorFactor;
     material_.emissiveFactor = glm::vec4(model.emissiveFactor, 1.0f); // w = 1: sample textures
     material_.metallicFactor = model.metallicFactor;
     material_.roughnessFactor = model.roughnessFactor;
 
-    // Flat, slightly rough dielectric ground; w = 0 selects the non-textured shading path.
-    groundMaterial_.baseColorFactor = glm::vec4(0.22f, 0.22f, 0.25f, 1.0f);
+    // Dark, glossy showroom floor: near-black albedo with low roughness so it mirrors the
+    // environment and the car. w = 0 selects the non-textured shading path.
+    groundMaterial_.baseColorFactor = glm::vec4(0.03f, 0.03f, 0.035f, 1.0f);
     groundMaterial_.emissiveFactor = glm::vec4(0.0f);
     groundMaterial_.metallicFactor = 0.0f;
-    groundMaterial_.roughnessFactor = 0.85f;
+    groundMaterial_.roughnessFactor = 0.5f;
 
     depthFormat_ = findDepthFormat();
     createPipelineCache();
@@ -1421,11 +1424,13 @@ void Renderer::buildInstances(float time) {
     instances_.reserve(kInstanceCount + 1);
     const float fit = kInstanceScale / modelRadius_;
     const float half = (kInstanceCount - 1) * 0.5f;
+    // Rest the mesh's actual lowest point on the ground (Y-rotation preserves height).
+    const float instanceY = kGroundY - fit * (modelMinY_ - modelCenter_.y);
     for (int i = 0; i < kInstanceCount; ++i) {
         const float x = (static_cast<float>(i) - half) * kInstanceSpacing;
         const float phase = static_cast<float>(i) * 1.6f;
-        glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(x, kInstanceY, 0.0f));
-        m = glm::rotate(m, time * glm::radians(30.0f) + phase, glm::vec3(0, 1, 0));
+        glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(x, instanceY, 0.0f));
+        m = glm::rotate(m, time * glm::radians(20.0f) + phase, glm::vec3(0, 1, 0));
         m = glm::scale(m, glm::vec3(fit));
         m = glm::translate(m, -modelCenter_);
         instances_.push_back({m, &vertexBuffer_, &indexBuffer_, indexCount_,

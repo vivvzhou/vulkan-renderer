@@ -198,6 +198,7 @@ private:
 
     glm::vec3 modelCenter_{0.0f};
     float modelRadius_ = 1.0f;
+    float modelMinY_ = 0.0f; // lowest vertex Y, for resting the mesh on the ground
 
     // Per-frame transforms computed in updateUniformBuffer and reused when recording.
     glm::mat4 groundModel_{1.0f};

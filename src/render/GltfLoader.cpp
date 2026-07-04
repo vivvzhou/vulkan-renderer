@@ -234,6 +234,8 @@ void computeBounds(MeshData& out) {
     }
     out.center = 0.5f * (lo + hi);
     out.radius = std::max(0.5f * glm::length(hi - lo), 1e-4f);
+    out.aabbMin = lo;
+    out.aabbMax = hi;
 }
 
 } // namespace
