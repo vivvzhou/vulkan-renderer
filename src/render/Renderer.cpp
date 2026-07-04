@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -29,6 +30,9 @@
 #endif
 #ifndef ENV_HDR_PATH
 #define ENV_HDR_PATH "environment.hdr"
+#endif
+#ifndef PIPELINE_CACHE_PATH
+#define PIPELINE_CACHE_PATH "pipeline_cache.bin"
 #endif
 
 namespace {
@@ -100,6 +104,8 @@ Renderer::Renderer(Window& window, Device& device, DeviceAllocator& allocator, S
     groundMaterial_.roughnessFactor = 0.85f;
 
     depthFormat_ = findDepthFormat();
+    createPipelineCache();
+    createTimestampPool();
     createShadowResources();
     createGeometryRenderPass();
     createLightingRenderPass();
@@ -125,6 +131,14 @@ Renderer::Renderer(Window& window, Device& device, DeviceAllocator& allocator, S
 Renderer::~Renderer() {
     const VkDevice dev = device_.handle();
     vkDeviceWaitIdle(dev);
+
+    if (pipelineCache_ != VK_NULL_HANDLE) {
+        savePipelineCache();
+        vkDestroyPipelineCache(dev, pipelineCache_, nullptr);
+    }
+    if (timestampPool_ != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(dev, timestampPool_, nullptr);
+    }
 
     for (VkSemaphore s : renderFinished_) {
         vkDestroySemaphore(dev, s, nullptr);
@@ -229,6 +243,120 @@ VkShaderModule Renderer::loadShaderModule(const char* path) {
     VkShaderModule module = VK_NULL_HANDLE;
     VK_CHECK(vkCreateShaderModule(device_.handle(), &ci, nullptr, &module));
     return module;
+}
+
+void Renderer::createPipelineCache() {
+    std::vector<char> initialData;
+    std::ifstream file(PIPELINE_CACHE_PATH, std::ios::binary | std::ios::ate);
+    if (file.is_open()) {
+        const auto size = static_cast<size_t>(file.tellg());
+        initialData.resize(size);
+        file.seekg(0);
+        file.read(initialData.data(), static_cast<std::streamsize>(size));
+    }
+
+    // Trust the on-disk data only if its header matches this device; otherwise the driver could
+    // ignore (or, on some drivers, mishandle) a cache built on different hardware.
+    bool valid = false;
+    if (initialData.size() >= 32) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(device_.physical(), &props);
+        const auto* bytes = reinterpret_cast<const uint8_t*>(initialData.data());
+        uint32_t headerLength = 0;
+        uint32_t headerVersion = 0;
+        uint32_t vendorID = 0;
+        uint32_t deviceID = 0;
+        std::memcpy(&headerLength, bytes + 0, 4);
+        std::memcpy(&headerVersion, bytes + 4, 4);
+        std::memcpy(&vendorID, bytes + 8, 4);
+        std::memcpy(&deviceID, bytes + 12, 4);
+        valid = headerLength > 0 && headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+                vendorID == props.vendorID && deviceID == props.deviceID &&
+                std::memcmp(bytes + 16, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+    }
+    if (!valid) {
+        initialData.clear();
+    }
+
+    VkPipelineCacheCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    ci.initialDataSize = initialData.size();
+    ci.pInitialData = initialData.empty() ? nullptr : initialData.data();
+    VK_CHECK(vkCreatePipelineCache(device_.handle(), &ci, nullptr, &pipelineCache_));
+    std::printf("Pipeline cache: %s (%zu bytes)\n",
+                valid ? "loaded from disk" : "starting empty", initialData.size());
+}
+
+void Renderer::savePipelineCache() const {
+    size_t size = 0;
+    if (vkGetPipelineCacheData(device_.handle(), pipelineCache_, &size, nullptr) != VK_SUCCESS ||
+        size == 0) {
+        return;
+    }
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(device_.handle(), pipelineCache_, &size, data.data()) !=
+        VK_SUCCESS) {
+        return;
+    }
+    std::ofstream file(PIPELINE_CACHE_PATH, std::ios::binary | std::ios::trunc);
+    if (file.is_open()) {
+        file.write(data.data(), static_cast<std::streamsize>(size));
+    }
+}
+
+void Renderer::createTimestampPool() {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(device_.physical(), &props);
+    timestampPeriodNs_ = props.limits.timestampPeriod; // nanoseconds per timestamp tick
+
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(device_.physical(), &count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(count);
+    vkGetPhysicalDeviceQueueFamilyProperties(device_.physical(), &count, families.data());
+    const uint32_t validBits = families[*device_.queueFamilies().graphics].timestampValidBits;
+
+    timestampsSupported_ = timestampPeriodNs_ > 0.0 && validBits > 0;
+    if (!timestampsSupported_) {
+        return;
+    }
+    timestampMask_ = validBits >= 64 ? ~0ull : ((1ull << validBits) - 1);
+
+    VkQueryPoolCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    ci.queryCount = kTimestampsPerFrame * kFramesInFlight;
+    VK_CHECK(vkCreateQueryPool(device_.handle(), &ci, nullptr, &timestampPool_));
+}
+
+void Renderer::readTimestamps(uint32_t frame) {
+    if (!timestampsSupported_) {
+        return;
+    }
+    std::array<uint64_t, kTimestampsPerFrame> ts{};
+    const uint32_t first = frame * kTimestampsPerFrame;
+    if (vkGetQueryPoolResults(device_.handle(), timestampPool_, first, kTimestampsPerFrame,
+                              sizeof(ts), ts.data(), sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+        return;
+    }
+    auto toMs = [&](uint64_t a, uint64_t b) {
+        const uint64_t delta = (b & timestampMask_) - (a & timestampMask_);
+        return static_cast<double>(delta) * timestampPeriodNs_ * 1e-6;
+    };
+    const double alpha = 0.1; // exponential moving average keeps the readout readable
+    gpuShadowMs_ += alpha * (toMs(ts[0], ts[1]) - gpuShadowMs_);
+    gpuGeomMs_ += alpha * (toMs(ts[1], ts[2]) - gpuGeomMs_);
+    gpuLightMs_ += alpha * (toMs(ts[2], ts[3]) - gpuLightMs_);
+
+    if (++titleThrottle_ >= 15) {
+        titleThrottle_ = 0;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "vulkan-renderer | GPU  shadow %.2f  geom %.2f  light %.2f  total %.2f ms",
+                      gpuShadowMs_, gpuGeomMs_, gpuLightMs_,
+                      gpuShadowMs_ + gpuGeomMs_ + gpuLightMs_);
+        window_.setTitle(buf);
+    }
 }
 
 // G-buffer attachment formats: position/normal need float precision; albedo/emissive fit in 8-bit.
@@ -563,7 +691,7 @@ void Renderer::createGeometryPipeline() {
     ci.layout = geomPipelineLayout_;
     ci.renderPass = geomRenderPass_;
     ci.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE, 1, &ci, nullptr,
+    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), pipelineCache_, 1, &ci, nullptr,
                                        &geomPipeline_));
 
     vkDestroyShaderModule(device_.handle(), frag, nullptr);
@@ -652,7 +780,7 @@ void Renderer::createLightingPipeline() {
     ci.layout = lightPipelineLayout_;
     ci.renderPass = lightRenderPass_;
     ci.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE, 1, &ci, nullptr,
+    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), pipelineCache_, 1, &ci, nullptr,
                                        &lightPipeline_));
 
     vkDestroyShaderModule(device_.handle(), frag, nullptr);
@@ -747,7 +875,7 @@ void Renderer::createShadowPipeline() {
     ci.layout = shadowPipelineLayout_;
     ci.renderPass = shadowRenderPass_;
     ci.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), VK_NULL_HANDLE, 1, &ci, nullptr,
+    VK_CHECK(vkCreateGraphicsPipelines(device_.handle(), pipelineCache_, 1, &ci, nullptr,
                                        &shadowPipeline_));
 
     vkDestroyShaderModule(device_.handle(), vert, nullptr);
@@ -844,7 +972,7 @@ void Renderer::createThreadResources() {
 void Renderer::createIbl() {
     // Precompute irradiance / prefilter / BRDF LUT from the HDR environment (uses commandPool_).
     ibl_ = std::make_unique<Ibl>(device_.handle(), allocator_, device_.graphicsQueue(),
-                                 commandPool_, ENV_HDR_PATH);
+                                 commandPool_, pipelineCache_, ENV_HDR_PATH);
 }
 
 void Renderer::immediateSubmit(const std::function<void(VkCommandBuffer)>& record) {
@@ -1271,6 +1399,19 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
         vkCmdBindIndexBuffer(cmd, ib.handle(), 0, VK_INDEX_TYPE_UINT32);
     };
 
+    // Timestamps bracket each pass; write with BOTTOM_OF_PIPE so the tick lands after the pass's
+    // work has fully drained. Queries are reset up front (queries persist across command buffers).
+    const uint32_t tsBase = currentFrame_ * kTimestampsPerFrame;
+    auto writeTs = [&](uint32_t slot, VkPipelineStageFlagBits stage) {
+        if (timestampsSupported_) {
+            vkCmdWriteTimestamp(cmd, stage, timestampPool_, tsBase + slot);
+        }
+    };
+    if (timestampsSupported_) {
+        vkCmdResetQueryPool(cmd, timestampPool_, tsBase, kTimestampsPerFrame);
+    }
+    writeTs(0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+
     // --- Shadow pass: render scene depth from the light into this frame's shadow map. ---
     VkClearValue shadowClear{};
     shadowClear.depthStencil = {1.0f, 0};
@@ -1294,6 +1435,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
         vkCmdDrawIndexed(cmd, inst.indexCount, 1, 0, 0, 0);
     }
     vkCmdEndRenderPass(cmd);
+    writeTs(1, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
     // --- Geometry pass: fill the G-buffer, recording the draws across worker threads. ---
     std::array<VkClearValue, kGBufferCount + 1> geomClears{};
@@ -1324,6 +1466,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     }
     vkCmdExecuteCommands(cmd, static_cast<uint32_t>(secondaries.size()), secondaries.data());
     vkCmdEndRenderPass(cmd);
+    writeTs(2, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
     // --- Lighting pass: fullscreen shading, sampling the G-buffer + shadow + IBL. ---
     VkRenderPassBeginInfo lightBegin{};
@@ -1340,6 +1483,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
                             &lightDescriptorSets_[currentFrame_], 0, nullptr);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
+    writeTs(3, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
@@ -1409,6 +1553,12 @@ void Renderer::drawFrame() {
 
     VK_CHECK(vkWaitForFences(dev, 1, &inFlight_[currentFrame_], VK_TRUE, UINT64_MAX));
 
+    // This frame slot's previous submission has completed, so its timestamps are ready. Skip the
+    // first kFramesInFlight frames, before any slot has been written.
+    if (frameIndex_ >= kFramesInFlight) {
+        readTimestamps(currentFrame_);
+    }
+
     uint32_t imageIndex = 0;
     VkResult acquire = vkAcquireNextImageKHR(dev, swapchain_.handle(), UINT64_MAX,
                                              imageAvailable_[currentFrame_], VK_NULL_HANDLE,
@@ -1461,6 +1611,7 @@ void Renderer::drawFrame() {
     }
 
     currentFrame_ = (currentFrame_ + 1) % kFramesInFlight;
+    ++frameIndex_;
 }
 
 void Renderer::run() {

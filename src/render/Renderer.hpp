@@ -36,6 +36,10 @@ public:
     void run();
 
 private:
+    void createPipelineCache();
+    void savePipelineCache() const;
+    void createTimestampPool();
+    void readTimestamps(uint32_t frame);
     void createShadowResources();
     void createGeometryRenderPass();
     void createLightingRenderPass();
@@ -85,6 +89,22 @@ private:
     Swapchain& swapchain_;
 
     VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
+
+    // Serialized across runs so pipeline creation is warm; fed to every pipeline build.
+    VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
+
+    // GPU timestamp profiling: 4 timestamps per frame bracket the shadow/geometry/lighting
+    // passes; results are read back one frame later and shown in the window title.
+    static constexpr uint32_t kTimestampsPerFrame = 4;
+    VkQueryPool timestampPool_ = VK_NULL_HANDLE;
+    bool timestampsSupported_ = false;
+    double timestampPeriodNs_ = 0.0;
+    uint64_t timestampMask_ = ~0ull;
+    double gpuShadowMs_ = 0.0;
+    double gpuGeomMs_ = 0.0;
+    double gpuLightMs_ = 0.0;
+    uint64_t frameIndex_ = 0;
+    uint32_t titleThrottle_ = 0;
 
     // Shadow pass: per-frame offscreen depth map rendered from the light.
     VkRenderPass shadowRenderPass_ = VK_NULL_HANDLE;

@@ -116,7 +116,8 @@ target_compile_definitions(vkrenderer PRIVATE
   GLFW_INCLUDE_VULKAN
   SHADER_DIR="${CMAKE_BINARY_DIR}/shaders"
   ASSET_PATH="${ASSET_PATH}"
-  ENV_HDR_PATH="${ENV_HDR_PATH}")
+  ENV_HDR_PATH="${ENV_HDR_PATH}"
+  PIPELINE_CACHE_PATH="${CMAKE_BINARY_DIR}/pipeline_cache.bin")
 
 if(WIN32)
   target_compile_definitions(vkrenderer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

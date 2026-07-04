@@ -59,8 +59,8 @@ uint32_t groups(uint32_t n) { return (n + 7) / 8; } // 8x8 compute local size
 } // namespace
 
 Ibl::Ibl(VkDevice device, DeviceAllocator& allocator, VkQueue queue, VkCommandPool pool,
-         const std::string& hdrPath)
-    : device_(device), allocator_(allocator), queue_(queue), pool_(pool) {
+         VkPipelineCache pipelineCache, const std::string& hdrPath)
+    : device_(device), allocator_(allocator), queue_(queue), pool_(pool), cache_(pipelineCache) {
     // Equirectangular maps wrap horizontally (longitude) and clamp vertically (latitude).
     VkSamplerCreateInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -308,7 +308,7 @@ void Ibl::computeIrradiance() {
     cpci.stage.pName = "main";
     cpci.layout = layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline));
+    VK_CHECK(vkCreateComputePipelines(device_, cache_, 1, &cpci, nullptr, &pipeline));
 
     immediateSubmit([&](VkCommandBuffer cmd) {
         transition(cmd, irradiance_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
@@ -393,7 +393,7 @@ void Ibl::computePrefilter() {
     cpci.stage.pName = "main";
     cpci.layout = layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline));
+    VK_CHECK(vkCreateComputePipelines(device_, cache_, 1, &cpci, nullptr, &pipeline));
 
     for (uint32_t m = 0; m < kPrefilterMips; ++m) {
         const uint32_t mipW = std::max(kPrefilterW >> m, 1u);
@@ -521,7 +521,7 @@ void Ibl::computeBrdf() {
     cpci.stage.pName = "main";
     cpci.layout = layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline));
+    VK_CHECK(vkCreateComputePipelines(device_, cache_, 1, &cpci, nullptr, &pipeline));
 
     immediateSubmit([&](VkCommandBuffer cmd) {
         transition(cmd, brdf_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,

@@ -35,6 +35,7 @@ Window::~Window() {
 bool Window::shouldClose() const { return glfwWindowShouldClose(window_) == GLFW_TRUE; }
 void Window::pollEvents() const { glfwPollEvents(); }
 void Window::waitEvents() const { glfwWaitEvents(); }
+void Window::setTitle(const char* title) const { glfwSetWindowTitle(window_, title); }
 
 VkSurfaceKHR Window::createSurface(VkInstance instance) const {
     VkSurfaceKHR surface = VK_NULL_HANDLE;

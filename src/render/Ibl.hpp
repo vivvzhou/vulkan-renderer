@@ -16,7 +16,7 @@
 class Ibl {
 public:
     Ibl(VkDevice device, DeviceAllocator& allocator, VkQueue queue, VkCommandPool pool,
-        const std::string& hdrPath);
+        VkPipelineCache pipelineCache, const std::string& hdrPath);
     ~Ibl();
 
     Ibl(const Ibl&) = delete;
@@ -52,6 +52,7 @@ private:
     DeviceAllocator& allocator_;
     VkQueue queue_;
     VkCommandPool pool_;
+    VkPipelineCache cache_;
 
     Tex env_;        // RGBA32F equirectangular environment
     Tex irradiance_; // RGBA16F diffuse irradiance

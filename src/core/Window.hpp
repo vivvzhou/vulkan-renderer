@@ -16,6 +16,7 @@ public:
     bool shouldClose() const;
     void pollEvents() const;
     void waitEvents() const;
+    void setTitle(const char* title) const;
 
     VkSurfaceKHR createSurface(VkInstance instance) const;
     void framebufferSize(int& width, int& height) const;

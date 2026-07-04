@@ -20,7 +20,7 @@ Built incrementally in phases — each one a runnable milestone:
 - [x] **Phase 5** — deferred G-buffer
 - [x] **Phase 6** — multithreaded secondary command buffers
 - [x] **Phase 7** — custom `VkDeviceMemory` allocator
-- [ ] **Phase 8** — pipeline cache + GPU timestamp profiling
+- [x] **Phase 8** — pipeline cache + GPU timestamp profiling
 - [ ] **Phase 9** — neural ambient occlusion (offline-trained MLP, GLSL compute inference)
 - [ ] **Phase 10** — portfolio polish
 
