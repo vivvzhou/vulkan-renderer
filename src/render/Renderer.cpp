@@ -61,8 +61,8 @@ struct MeshPush {
 };
 
 // Fixed eye position; also fed to the fragment shader for the view vector.
-constexpr glm::vec3 kEye = glm::vec3(9.0f, 8.0f, 14.0f);
-constexpr glm::vec3 kLookAt = glm::vec3(0.0f, -0.3f, 0.0f);
+constexpr glm::vec3 kEye = glm::vec3(3.6f, 2.2f, 6.0f);
+constexpr glm::vec3 kLookAt = glm::vec3(0.0f, -0.2f, 0.0f);
 
 // Directional key light: travel direction and radiance. Casts the shadow.
 constexpr glm::vec3 kLightDir = glm::vec3(-0.5f, -1.0f, -0.4f);
@@ -70,11 +70,11 @@ constexpr glm::vec3 kLightColor = glm::vec3(3.0f);
 
 constexpr float kGroundY = -1.2f; // ground plane sits just below the fitted meshes
 
-// A grid of mesh instances so the multithreaded recording has real work to partition.
-constexpr int kGridDim = 5; // kGridDim^2 instances
-constexpr float kGridSpacing = 2.4f;
-constexpr float kInstanceScale = 0.9f; // fitted mesh radius after scaling
-constexpr float kInstanceY = -0.3f;    // instance center height (rests on the ground)
+// A short row of mesh instances (still partitioned across the recording threads).
+constexpr int kInstanceCount = 2;
+constexpr float kInstanceSpacing = 2.7f;
+constexpr float kInstanceScale = 1.0f; // fitted mesh radius after scaling
+constexpr float kInstanceY = -0.2f;    // instance center height (rests on the ground)
 
 std::vector<char> readFile(const std::string& path) {
     std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -1416,24 +1416,21 @@ void Renderer::createSyncObjects() {
 }
 
 void Renderer::buildInstances(float time) {
-    // A grid of spinning mesh instances (staggered rotation phase) plus the ground plane.
+    // A short row of spinning mesh instances (staggered rotation phase) plus the ground plane.
     instances_.clear();
-    instances_.reserve(static_cast<size_t>(kGridDim) * kGridDim + 1);
+    instances_.reserve(kInstanceCount + 1);
     const float fit = kInstanceScale / modelRadius_;
-    const float half = (kGridDim - 1) * 0.5f;
-    for (int j = 0; j < kGridDim; ++j) {
-        for (int i = 0; i < kGridDim; ++i) {
-            const float x = (static_cast<float>(i) - half) * kGridSpacing;
-            const float z = (static_cast<float>(j) - half) * kGridSpacing;
-            const float phase = static_cast<float>(i * kGridDim + j) * 0.7f;
-            glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(x, kInstanceY, z));
-            m = glm::rotate(m, time * glm::radians(30.0f) + phase, glm::vec3(0, 1, 0));
-            m = glm::scale(m, glm::vec3(fit));
-            m = glm::translate(m, -modelCenter_);
-            instances_.push_back({m, &vertexBuffer_, &indexBuffer_, indexCount_,
-                                  material_.baseColorFactor, material_.emissiveFactor,
-                                  material_.metallicFactor, material_.roughnessFactor});
-        }
+    const float half = (kInstanceCount - 1) * 0.5f;
+    for (int i = 0; i < kInstanceCount; ++i) {
+        const float x = (static_cast<float>(i) - half) * kInstanceSpacing;
+        const float phase = static_cast<float>(i) * 1.6f;
+        glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(x, kInstanceY, 0.0f));
+        m = glm::rotate(m, time * glm::radians(30.0f) + phase, glm::vec3(0, 1, 0));
+        m = glm::scale(m, glm::vec3(fit));
+        m = glm::translate(m, -modelCenter_);
+        instances_.push_back({m, &vertexBuffer_, &indexBuffer_, indexCount_,
+                              material_.baseColorFactor, material_.emissiveFactor,
+                              material_.metallicFactor, material_.roughnessFactor});
     }
     instances_.push_back({groundModel_, &groundVertexBuffer_, &groundIndexBuffer_,
                           groundIndexCount_, groundMaterial_.baseColorFactor,
@@ -1656,13 +1653,13 @@ void Renderer::updateUniformBuffer(uint32_t frame) {
     groundModel_ = glm::mat4(1.0f); // ground vertices are already in world space
     buildInstances(t);              // rebuild the per-frame instance grid for the workers
 
-    // Light-space matrix: orthographic projection from the light, wide enough to cover the grid.
+    // Light-space matrix: orthographic projection from the light, framing the row of instances.
     const glm::vec3 L = glm::normalize(kLightDir);
     const glm::vec3 target = kLookAt;
-    const glm::vec3 lightEye = target - L * 14.0f;
+    const glm::vec3 lightEye = target - L * 8.0f;
     const glm::mat4 lightView = glm::lookAt(lightEye, target, glm::vec3(0.0f, 1.0f, 0.0f));
-    const float r = 7.5f; // half-extent of the shadowed region around the grid
-    const glm::mat4 lightProj = glm::ortho(-r, r, -r, r, 0.1f, 40.0f);
+    const float r = 3.5f; // half-extent of the shadowed region around the instances
+    const glm::mat4 lightProj = glm::ortho(-r, r, -r, r, 0.1f, 20.0f);
     lightSpace_ = lightProj * lightView; // no Y flip: render and sample use the same matrix
 
     CameraUBO ubo{};
