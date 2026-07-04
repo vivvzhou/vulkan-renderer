@@ -34,6 +34,9 @@
 #ifndef PIPELINE_CACHE_PATH
 #define PIPELINE_CACHE_PATH "pipeline_cache.bin"
 #endif
+#ifndef SSAO_WEIGHTS_PATH
+#define SSAO_WEIGHTS_PATH "ssao_mlp.bin"
+#endif
 
 namespace {
 
@@ -117,6 +120,7 @@ Renderer::Renderer(Window& window, Device& device, DeviceAllocator& allocator, S
     createFramebuffers();
     createCommandResources();
     createThreadResources();
+    createSsaoResources();
     createIbl();
     createTextures(model);
     createMesh(model);
@@ -124,6 +128,7 @@ Renderer::Renderer(Window& window, Device& device, DeviceAllocator& allocator, S
     createUniformBuffers();
     createDescriptorPool();
     createGeomDescriptors();
+    createSsaoDescriptors();
     createLightDescriptors();
     createSyncObjects();
 }
@@ -202,6 +207,15 @@ Renderer::~Renderer() {
     }
     if (lightRenderPass_ != VK_NULL_HANDLE) {
         vkDestroyRenderPass(dev, lightRenderPass_, nullptr);
+    }
+    if (ssaoPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, ssaoPipeline_, nullptr);
+    }
+    if (ssaoPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, ssaoPipelineLayout_, nullptr);
+    }
+    if (ssaoSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, ssaoSetLayout_, nullptr);
     }
     if (geomPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, geomPipeline_, nullptr);
@@ -346,15 +360,17 @@ void Renderer::readTimestamps(uint32_t frame) {
     const double alpha = 0.1; // exponential moving average keeps the readout readable
     gpuShadowMs_ += alpha * (toMs(ts[0], ts[1]) - gpuShadowMs_);
     gpuGeomMs_ += alpha * (toMs(ts[1], ts[2]) - gpuGeomMs_);
-    gpuLightMs_ += alpha * (toMs(ts[2], ts[3]) - gpuLightMs_);
+    gpuSsaoMs_ += alpha * (toMs(ts[2], ts[3]) - gpuSsaoMs_);
+    gpuLightMs_ += alpha * (toMs(ts[3], ts[4]) - gpuLightMs_);
 
     if (++titleThrottle_ >= 15) {
         titleThrottle_ = 0;
-        char buf[160];
-        std::snprintf(buf, sizeof(buf),
-                      "vulkan-renderer | GPU  shadow %.2f  geom %.2f  light %.2f  total %.2f ms",
-                      gpuShadowMs_, gpuGeomMs_, gpuLightMs_,
-                      gpuShadowMs_ + gpuGeomMs_ + gpuLightMs_);
+        char buf[192];
+        std::snprintf(
+            buf, sizeof(buf),
+            "vulkan-renderer | GPU  shadow %.2f  geom %.2f  neuralAO %.2f  light %.2f  total %.2f ms",
+            gpuShadowMs_, gpuGeomMs_, gpuSsaoMs_, gpuLightMs_,
+            gpuShadowMs_ + gpuGeomMs_ + gpuSsaoMs_ + gpuLightMs_);
         window_.setTitle(buf);
     }
 }
@@ -364,6 +380,7 @@ static constexpr VkFormat kGPositionFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 static constexpr VkFormat kGNormalFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 static constexpr VkFormat kGAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;
 static constexpr VkFormat kGEmissiveFormat = VK_FORMAT_R8G8B8A8_UNORM;
+static constexpr VkFormat kSsaoFormat = VK_FORMAT_R16_SFLOAT;
 
 void Renderer::createGeometryRenderPass() {
     // Four color targets + depth. All colors end in SHADER_READ_ONLY so the lighting pass can
@@ -418,7 +435,9 @@ void Renderer::createGeometryRenderPass() {
     deps[1].srcSubpass = 0;
     deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
     deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    // The G-buffer is sampled by both the SSAO compute pass and the lighting fragment shader.
+    deps[1].dstStageMask =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -571,9 +590,9 @@ void Renderer::createDescriptorSetLayouts() {
         VK_CHECK(vkCreateDescriptorSetLayout(device_.handle(), &ci, nullptr, &geomSetLayout_));
     }
 
-    // Lighting set: UBO (0, vertex+fragment) + 4 G-buffer + shadow + 3 IBL + environment maps.
+    // Lighting set: UBO (0) + 4 G-buffer + shadow + 3 IBL + environment + SSAO maps.
     {
-        constexpr int kImageBindings = kGBufferCount + 1 + kIblTextureCount + 1;
+        constexpr int kImageBindings = kGBufferCount + 1 + kIblTextureCount + 1 + 1;
         std::array<VkDescriptorSetLayoutBinding, 1 + kImageBindings> bindings{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -882,6 +901,20 @@ void Renderer::createShadowPipeline() {
 }
 
 void Renderer::createGBuffers() {
+    // Point sampling with edge clamp for the G-buffer / AO images (no blending across edges).
+    // Created once; the images below are recreated on resize but the sampler persists.
+    if (gbufferSampler_ == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_NEAREST;
+        si.minFilter = VK_FILTER_NEAREST;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(device_.handle(), &si, nullptr, &gbufferSampler_));
+    }
+
     const VkExtent2D extent = swapchain_.extent();
     const VkImageUsageFlags colorUsage =
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -897,6 +930,9 @@ void Renderer::createGBuffers() {
                             VK_IMAGE_ASPECT_COLOR_BIT);
         gb.depth = Image(allocator_, extent.width, extent.height, depthFormat_,
                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+        gb.ssao = Image(allocator_, extent.width, extent.height, kSsaoFormat,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT);
 
         const std::array<VkImageView, kGBufferCount + 1> attachments = {
             gb.position.view(), gb.normal.view(), gb.albedo.view(), gb.emissive.view(),
@@ -1143,20 +1179,24 @@ void Renderer::createUniformBuffers() {
 }
 
 void Renderer::createDescriptorPool() {
-    // Geometry sets: UBO + kTextureCount samplers each. Lighting sets: UBO + (4 G-buffer + shadow
-    // + 3 IBL + environment) = 9 samplers each. Two sets of each per frame.
-    constexpr int kLightImages = kGBufferCount + 1 + kIblTextureCount + 1;
-    std::array<VkDescriptorPoolSize, 2> sizes{};
+    // Per frame: a geometry set (UBO + material samplers), a lighting set (UBO + 10 samplers),
+    // and an SSAO set (2 samplers + 1 storage buffer + 1 storage image).
+    constexpr int kLightImages = kGBufferCount + 1 + kIblTextureCount + 1 + 1;
+    std::array<VkDescriptorPoolSize, 4> sizes{};
     sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = 2 * kFramesInFlight;
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = kFramesInFlight * (kTextureCount + kLightImages);
+    sizes[1].descriptorCount = kFramesInFlight * (kTextureCount + kLightImages + 2);
+    sizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sizes[2].descriptorCount = kFramesInFlight;
+    sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    sizes[3].descriptorCount = kFramesInFlight;
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ci.poolSizeCount = static_cast<uint32_t>(sizes.size());
     ci.pPoolSizes = sizes.data();
-    ci.maxSets = 2 * kFramesInFlight;
+    ci.maxSets = 3 * kFramesInFlight;
     VK_CHECK(vkCreateDescriptorPool(device_.handle(), &ci, nullptr, &descriptorPool_));
 }
 
@@ -1202,17 +1242,6 @@ void Renderer::createGeomDescriptors() {
 }
 
 void Renderer::createLightDescriptors() {
-    // Point sampling with edge clamp for the G-buffer (no blending across geometry edges).
-    VkSamplerCreateInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    si.magFilter = VK_FILTER_NEAREST;
-    si.minFilter = VK_FILTER_NEAREST;
-    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(device_.handle(), &si, nullptr, &gbufferSampler_));
-
     const std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, lightSetLayout_);
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -1231,7 +1260,7 @@ void Renderer::writeLightDescriptors() {
         bufferInfo.buffer = uniformBuffers_[i].handle();
         bufferInfo.range = sizeof(CameraUBO);
 
-        constexpr int kImageBindings = kGBufferCount + 1 + kIblTextureCount + 1;
+        constexpr int kImageBindings = kGBufferCount + 1 + kIblTextureCount + 1 + 1;
         constexpr VkImageLayout kRO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         const GBuffer& gb = gbuffers_[i];
         std::array<VkDescriptorImageInfo, kImageBindings> imageInfos = {{
@@ -1244,6 +1273,7 @@ void Renderer::writeLightDescriptors() {
             {ibl_->environmentSampler(), ibl_->prefilterView(), kRO},
             {ibl_->lutSampler(), ibl_->brdfLutView(), kRO},
             {ibl_->environmentSampler(), ibl_->environmentView(), kRO},
+            {gbufferSampler_, gb.ssao.view(), kRO}, // binding 10: neural AO
         }};
 
         std::array<VkWriteDescriptorSet, 1 + kImageBindings> writes{};
@@ -1261,6 +1291,104 @@ void Renderer::writeLightDescriptors() {
             writes[t + 1].descriptorCount = 1;
             writes[t + 1].pImageInfo = &imageInfos[t];
         }
+        vkUpdateDescriptorSets(device_.handle(), static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+    }
+}
+
+void Renderer::createSsaoResources() {
+    // Load the offline-trained MLP weights (header: float count, then the float blob) into an
+    // SSBO the compute shader reads.
+    std::vector<char> file = readFile(SSAO_WEIGHTS_PATH);
+    if (file.size() < sizeof(uint32_t)) {
+        throw std::runtime_error("SSAO weights file too small");
+    }
+    uint32_t floatCount = 0;
+    std::memcpy(&floatCount, file.data(), sizeof(uint32_t));
+    const VkDeviceSize weightBytes = static_cast<VkDeviceSize>(floatCount) * sizeof(float);
+    if (file.size() < sizeof(uint32_t) + weightBytes) {
+        throw std::runtime_error("SSAO weights file truncated");
+    }
+    ssaoWeights_ = createDeviceLocalBuffer(file.data() + sizeof(uint32_t), weightBytes,
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    // Set layout: gPosition, gNormal (samplers), weights (SSBO), AO out (storage image).
+    std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
+    for (uint32_t i = 0; i < bindings.size(); ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
+    VkDescriptorSetLayoutCreateInfo slci{};
+    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    slci.bindingCount = static_cast<uint32_t>(bindings.size());
+    slci.pBindings = bindings.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(device_.handle(), &slci, nullptr, &ssaoSetLayout_));
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &ssaoSetLayout_;
+    VK_CHECK(vkCreatePipelineLayout(device_.handle(), &plci, nullptr, &ssaoPipelineLayout_));
+
+    VkShaderModule module = loadShaderModule("ssao.comp.spv");
+    VkComputePipelineCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = module;
+    cpci.stage.pName = "main";
+    cpci.layout = ssaoPipelineLayout_;
+    VK_CHECK(vkCreateComputePipelines(device_.handle(), pipelineCache_, 1, &cpci, nullptr,
+                                      &ssaoPipeline_));
+    vkDestroyShaderModule(device_.handle(), module, nullptr);
+}
+
+void Renderer::createSsaoDescriptors() {
+    const std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, ssaoSetLayout_);
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = descriptorPool_;
+    allocInfo.descriptorSetCount = kFramesInFlight;
+    allocInfo.pSetLayouts = layouts.data();
+    ssaoDescriptorSets_.resize(kFramesInFlight);
+    VK_CHECK(vkAllocateDescriptorSets(device_.handle(), &allocInfo, ssaoDescriptorSets_.data()));
+    writeSsaoDescriptors();
+}
+
+void Renderer::writeSsaoDescriptors() {
+    for (int i = 0; i < kFramesInFlight; ++i) {
+        const GBuffer& gb = gbuffers_[i];
+        VkDescriptorImageInfo positionInfo{gbufferSampler_, gb.position.view(),
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo normalInfo{gbufferSampler_, gb.normal.view(),
+                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorBufferInfo weightsInfo{ssaoWeights_.handle(), 0, VK_WHOLE_SIZE};
+        VkDescriptorImageInfo aoInfo{VK_NULL_HANDLE, gb.ssao.view(), VK_IMAGE_LAYOUT_GENERAL};
+
+        std::array<VkWriteDescriptorSet, 4> writes{};
+        for (auto& w : writes) {
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = ssaoDescriptorSets_[i];
+            w.descriptorCount = 1;
+        }
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].pImageInfo = &positionInfo;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].pImageInfo = &normalInfo;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[2].pBufferInfo = &weightsInfo;
+        writes[3].dstBinding = 3;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[3].pImageInfo = &aoInfo;
         vkUpdateDescriptorSets(device_.handle(), static_cast<uint32_t>(writes.size()),
                                writes.data(), 0, nullptr);
     }
@@ -1468,7 +1596,35 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     vkCmdEndRenderPass(cmd);
     writeTs(2, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
-    // --- Lighting pass: fullscreen shading, sampling the G-buffer + shadow + IBL. ---
+    // --- Neural AO pass: run the MLP over the G-buffer into this frame's SSAO image. ---
+    Image& ssaoImage = gbuffers_[currentFrame_].ssao;
+    auto ssaoBarrier = [&](VkImageLayout oldL, VkImageLayout newL, VkPipelineStageFlags srcStage,
+                           VkPipelineStageFlags dstStage, VkAccessFlags srcA, VkAccessFlags dstA) {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = oldL;
+        b.newLayout = newL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = ssaoImage.handle();
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = srcA;
+        b.dstAccessMask = dstA;
+        vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    ssaoBarrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                VK_ACCESS_SHADER_WRITE_BIT);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoPipelineLayout_, 0, 1,
+                            &ssaoDescriptorSets_[currentFrame_], 0, nullptr);
+    vkCmdDispatch(cmd, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+    ssaoBarrier(VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    writeTs(3, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+    // --- Lighting pass: fullscreen shading, sampling the G-buffer + shadow + IBL + SSAO. ---
     VkRenderPassBeginInfo lightBegin{};
     lightBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     lightBegin.renderPass = lightRenderPass_;
@@ -1483,7 +1639,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
                             &lightDescriptorSets_[currentFrame_], 0, nullptr);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
-    writeTs(3, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    writeTs(4, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
@@ -1543,9 +1699,10 @@ void Renderer::recreateSwapchain() {
     }
 
     swapchain_.recreate(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
-    createGBuffers();          // G-buffer must match the new extent
+    createGBuffers();          // G-buffer (incl. SSAO image) must match the new extent
     createFramebuffers();
-    writeLightDescriptors();   // light sets point at the new G-buffer views
+    writeSsaoDescriptors();    // SSAO sets point at the new G-buffer + AO views
+    writeLightDescriptors();   // light sets point at the new G-buffer + AO views
 }
 
 void Renderer::drawFrame() {

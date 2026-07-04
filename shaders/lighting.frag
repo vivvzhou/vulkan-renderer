@@ -22,6 +22,7 @@ layout(binding = 6) uniform sampler2D irradianceMap;
 layout(binding = 7) uniform sampler2D prefilterMap;
 layout(binding = 8) uniform sampler2D brdfLut;
 layout(binding = 9) uniform sampler2D environmentMap;
+layout(binding = 10) uniform sampler2D ssaoMap; // neural ambient occlusion
 
 layout(location = 0) in vec2 fragUV;
 layout(location = 1) in vec3 viewDir;
@@ -126,7 +127,11 @@ void main() {
     vec3 prefiltered = textureLod(prefilterMap, dirToUv(R), lod).rgb;
     vec2 envBRDF = texture(brdfLut, vec2(NdotV, roughness)).rg;
     vec3 specularIBL = prefiltered * (F * envBRDF.x + envBRDF.y);
-    vec3 ambient = (kD * diffuseIBL + specularIBL) * ao;
+
+    // Neural screen-space AO modulates the (indirect) ambient term along with the baked AO map.
+    // The power is an intensity control that deepens contact/crease darkening.
+    float ssao = pow(clamp(texture(ssaoMap, fragUV).r, 0.0, 1.0), 2.5);
+    vec3 ambient = (kD * diffuseIBL + specularIBL) * ao * ssao;
 
     outColor = vec4(aces(ambient + Lo + emissive), 1.0);
 }

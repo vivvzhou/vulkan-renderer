@@ -47,6 +47,9 @@ private:
     void createGeometryPipeline();
     void createShadowPipeline();
     void createLightingPipeline();
+    void createSsaoResources();
+    void createSsaoDescriptors();
+    void writeSsaoDescriptors();
     void createGBuffers();
     void createFramebuffers();
     void createCommandResources();
@@ -93,15 +96,16 @@ private:
     // Serialized across runs so pipeline creation is warm; fed to every pipeline build.
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
 
-    // GPU timestamp profiling: 4 timestamps per frame bracket the shadow/geometry/lighting
-    // passes; results are read back one frame later and shown in the window title.
-    static constexpr uint32_t kTimestampsPerFrame = 4;
+    // GPU timestamp profiling: 5 timestamps per frame bracket the shadow / geometry / neural-AO
+    // / lighting passes; results are read back one frame later and shown in the window title.
+    static constexpr uint32_t kTimestampsPerFrame = 5;
     VkQueryPool timestampPool_ = VK_NULL_HANDLE;
     bool timestampsSupported_ = false;
     double timestampPeriodNs_ = 0.0;
     uint64_t timestampMask_ = ~0ull;
     double gpuShadowMs_ = 0.0;
     double gpuGeomMs_ = 0.0;
+    double gpuSsaoMs_ = 0.0;
     double gpuLightMs_ = 0.0;
     uint64_t frameIndex_ = 0;
     uint32_t titleThrottle_ = 0;
@@ -125,10 +129,18 @@ private:
         Image albedo;   // rgb albedo, a metallic
         Image emissive; // rgb emissive, a ao
         Image depth;
+        Image ssao;     // r16f neural ambient occlusion (compute output)
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
     };
     std::array<GBuffer, kFramesInFlight> gbuffers_;
     VkSampler gbufferSampler_ = VK_NULL_HANDLE;
+
+    // Neural AO compute pass: an MLP (weights in an SSBO) reads the G-buffer and writes ssao.
+    VkDescriptorSetLayout ssaoSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout ssaoPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline ssaoPipeline_ = VK_NULL_HANDLE;
+    Buffer ssaoWeights_;
+    std::vector<VkDescriptorSet> ssaoDescriptorSets_; // per frame
 
     // Lighting pass: fullscreen, reads the G-buffer + shadow + IBL, writes the swapchain.
     VkRenderPass lightRenderPass_ = VK_NULL_HANDLE;

@@ -21,7 +21,7 @@ Built incrementally in phases — each one a runnable milestone:
 - [x] **Phase 6** — multithreaded secondary command buffers
 - [x] **Phase 7** — custom `VkDeviceMemory` allocator
 - [x] **Phase 8** — pipeline cache + GPU timestamp profiling
-- [ ] **Phase 9** — neural ambient occlusion (offline-trained MLP, GLSL compute inference)
+- [x] **Phase 9** — neural ambient occlusion (offline-trained MLP, GLSL compute inference)
 - [ ] **Phase 10** — portfolio polish
 
 ## Build
@@ -29,6 +29,9 @@ Built incrementally in phases — each one a runnable milestone:
 Requires the [Vulkan SDK](https://vulkan.lunarg.com), CMake ≥ 3.24, and a C++20 compiler.
 Third-party dependencies (GLFW, GLM, stb, tinygltf) are fetched automatically by CMake.
 GPU memory is managed by a hand-written allocator (Phase 7); VMA was the Phase 2 reference.
+
+The neural-AO weights (`assets/ssao_mlp.bin`) are committed. To retrain them:
+`python tools/train_ssao_mlp.py` (requires NumPy).
 
 ```sh
 cmake -S . -B build

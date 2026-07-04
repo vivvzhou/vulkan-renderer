@@ -117,7 +117,8 @@ target_compile_definitions(vkrenderer PRIVATE
   SHADER_DIR="${CMAKE_BINARY_DIR}/shaders"
   ASSET_PATH="${ASSET_PATH}"
   ENV_HDR_PATH="${ENV_HDR_PATH}"
-  PIPELINE_CACHE_PATH="${CMAKE_BINARY_DIR}/pipeline_cache.bin")
+  PIPELINE_CACHE_PATH="${CMAKE_BINARY_DIR}/pipeline_cache.bin"
+  SSAO_WEIGHTS_PATH="${CMAKE_SOURCE_DIR}/assets/ssao_mlp.bin")
 
 if(WIN32)
   target_compile_definitions(vkrenderer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -136,4 +137,5 @@ target_compile_shaders(vkrenderer
     shaders/shadow.vert
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp
-    shaders/ibl_brdf.comp)
+    shaders/ibl_brdf.comp
+    shaders/ssao.comp)
