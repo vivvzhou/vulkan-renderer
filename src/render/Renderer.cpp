@@ -62,8 +62,8 @@ struct MeshPush {
 
 // Fixed eye position; also fed to the fragment shader for the view vector. A low 3/4 angle for
 // a car-hero shot.
-constexpr glm::vec3 kEye = glm::vec3(2.2f, 1.5f, 3.3f);
-constexpr glm::vec3 kLookAt = glm::vec3(0.0f, -0.65f, 0.0f);
+constexpr glm::vec3 kEye = glm::vec3(2.7f, 1.5f, 4.0f);
+constexpr glm::vec3 kLookAt = glm::vec3(0.0f, -0.55f, 0.0f);
 
 // Directional key light: travel direction and radiance. Bright so it reads as the key light
 // against the dark, IBL-dimmed backdrop; also casts the shadow.
@@ -75,7 +75,7 @@ constexpr float kGroundY = -1.2f; // ground plane sits just below the fitted mes
 // Mesh instances (still partitioned across the recording threads).
 constexpr int kInstanceCount = 1;
 constexpr float kInstanceSpacing = 2.7f;
-constexpr float kInstanceScale = 1.0f; // fitted mesh radius after scaling
+constexpr float kInstanceScale = 1.45f; // fitted mesh radius after scaling
 
 std::vector<char> readFile(const std::string& path) {
     std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -97,10 +97,13 @@ Renderer::Renderer(Window& window, Device& device, DeviceAllocator& allocator, S
     modelCenter_ = model.center;
     modelRadius_ = model.radius;
     modelMinY_ = model.aabbMin.y;
-    material_.baseColorFactor = model.baseColorFactor;
-    material_.emissiveFactor = glm::vec4(model.emissiveFactor, 1.0f); // w = 1: sample textures
-    material_.metallicFactor = model.metallicFactor;
-    material_.roughnessFactor = model.roughnessFactor;
+    // The car has many materials but our loader is single-material, so shade it as one glossy
+    // red car paint (flat-material path: emissiveFactor.w = 0 ignores the maps and uses geometry
+    // normals). This reads as a clean painted-car / concept-render look.
+    material_.baseColorFactor = glm::vec4(0.5f, 0.02f, 0.02f, 1.0f);
+    material_.emissiveFactor = glm::vec4(0.0f); // w = 0: flat material
+    material_.metallicFactor = 0.2f;
+    material_.roughnessFactor = 0.3f;
 
     // Dark, glossy showroom floor: near-black albedo with low roughness so it mirrors the
     // environment and the car. w = 0 selects the non-textured shading path.

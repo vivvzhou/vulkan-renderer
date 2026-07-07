@@ -56,12 +56,8 @@ FetchContent_Declare(tinygltf
 
 FetchContent_MakeAvailable(glfw glm stb tinygltf)
 
-# Sample model (single binary asset, downloaded but not extracted). Not committed to the repo.
-FetchContent_Declare(model
-  URL https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb
-  DOWNLOAD_NO_EXTRACT TRUE)
-FetchContent_MakeAvailable(model)
-set(ASSET_PATH "${model_SOURCE_DIR}/ToyCar.glb")
+# Sports-car model, committed to the repo (a Draco-decompressed glTF the loader can read).
+set(ASSET_PATH "${CMAKE_SOURCE_DIR}/assets/sportscar.glb")
 message(STATUS "Model asset   : ${ASSET_PATH}")
 
 # HDR environment map for image-based lighting (CC0, Poly Haven). Not committed.
