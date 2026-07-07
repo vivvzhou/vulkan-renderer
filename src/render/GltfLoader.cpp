@@ -120,6 +120,8 @@ void appendPrimitive(const tinygltf::Model& model, const tinygltf::Primitive& pr
     // Indices (widen whatever integer width glTF used to uint32, offset into the merged buffer).
     const tinygltf::Accessor& idxAcc = model.accessors[prim.indices];
     const unsigned char* idxData = accessorPtr(model, idxAcc);
+    out.submeshes.push_back({static_cast<uint32_t>(out.indices.size()),
+                             static_cast<uint32_t>(idxAcc.count), prim.material});
     for (size_t i = 0; i < idxAcc.count; ++i) {
         uint32_t index = 0;
         switch (idxAcc.componentType) {
@@ -225,6 +227,29 @@ void loadMaterial(const tinygltf::Model& model, MeshData& out) {
         glm::vec3(mat.emissiveFactor[0], mat.emissiveFactor[1], mat.emissiveFactor[2]);
 }
 
+// Load every material's factors + name (no maps) for per-submesh multi-material shading, and note
+// whether the model uses any base-color textures at all.
+void loadAllMaterials(const tinygltf::Model& model, MeshData& out) {
+    for (const tinygltf::Material& mat : model.materials) {
+        const auto& pbr = mat.pbrMetallicRoughness;
+        SubMaterial sm;
+        sm.baseColorFactor = glm::vec4(pbr.baseColorFactor[0], pbr.baseColorFactor[1],
+                                       pbr.baseColorFactor[2], pbr.baseColorFactor[3]);
+        sm.emissiveFactor =
+            glm::vec3(mat.emissiveFactor[0], mat.emissiveFactor[1], mat.emissiveFactor[2]);
+        sm.metallicFactor = static_cast<float>(pbr.metallicFactor);
+        sm.roughnessFactor = static_cast<float>(pbr.roughnessFactor);
+        sm.name = mat.name;
+        out.materials.push_back(sm);
+        if (pbr.baseColorTexture.index >= 0) {
+            out.hasTextures = true;
+        }
+    }
+    if (out.materials.empty()) {
+        out.materials.push_back(SubMaterial{}); // default; submeshes with material -1 map here
+    }
+}
+
 void computeBounds(MeshData& out) {
     glm::vec3 lo(std::numeric_limits<float>::max());
     glm::vec3 hi(std::numeric_limits<float>::lowest());
@@ -272,6 +297,7 @@ MeshData loadGltf(const std::string& path) {
     }
 
     loadMaterial(model, out);
+    loadAllMaterials(model, out);
     computeBounds(out);
     return out;
 }

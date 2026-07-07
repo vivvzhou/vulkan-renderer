@@ -57,6 +57,7 @@ private:
     void createIbl();
     void createTextures(const MeshData& model);
     void createMesh(const MeshData& model);
+    void buildMeshSubDraws(const MeshData& model);
     void createGround();
     void createUniformBuffers();
     void createDescriptorPool();
@@ -159,16 +160,32 @@ private:
     std::array<VkCommandPool, kThreadCount> threadCommandPools_{};
     std::array<std::array<VkCommandBuffer, kFramesInFlight>, kThreadCount> geomSecondaries_{};
 
-    // One draw's worth of state; the per-frame instance list is partitioned across the workers.
+    // Per-object material factors; emissiveFactor.w is the "use textures" flag (0 = flat).
+    struct MaterialPush {
+        glm::vec4 baseColorFactor{1.0f};
+        glm::vec4 emissiveFactor{0.0f};
+        float metallicFactor = 1.0f;
+        float roughnessFactor = 1.0f;
+    };
+    MaterialPush groundMaterial_;
+
+    // A material-homogeneous slice of a mesh's index buffer (one glTF material).
+    struct SubDraw {
+        uint32_t firstIndex;
+        uint32_t indexCount;
+        MaterialPush material;
+    };
+    std::vector<SubDraw> meshSubDraws_;   // the loaded model, split by material
+    std::vector<SubDraw> groundSubDraws_; // the ground plane (single flat material)
+
+    // One drawable object; the per-frame instance list is partitioned across the workers. The
+    // shadow pass draws totalIndexCount at once; the geometry pass draws each subDraw separately.
     struct DrawInstance {
         glm::mat4 model;
         const Buffer* vertexBuffer;
         const Buffer* indexBuffer;
-        uint32_t indexCount;
-        glm::vec4 baseColorFactor;
-        glm::vec4 emissiveFactor; // w = useTextures flag
-        float metallicFactor;
-        float roughnessFactor;
+        uint32_t totalIndexCount;
+        const std::vector<SubDraw>* subDraws;
     };
     std::vector<DrawInstance> instances_;
 
@@ -177,16 +194,6 @@ private:
     VkSampler sampler_ = VK_NULL_HANDLE;
 
     std::unique_ptr<Ibl> ibl_;
-
-    // Per-object material factors; emissiveFactor.w is the "use textures" flag (0 = flat ground).
-    struct MaterialPush {
-        glm::vec4 baseColorFactor{1.0f};
-        glm::vec4 emissiveFactor{0.0f};
-        float metallicFactor = 1.0f;
-        float roughnessFactor = 1.0f;
-    };
-    MaterialPush material_;
-    MaterialPush groundMaterial_;
 
     // Mesh + ground geometry.
     Buffer vertexBuffer_;

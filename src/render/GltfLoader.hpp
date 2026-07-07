@@ -16,14 +16,35 @@ struct TextureData {
     uint32_t height = 1;
 };
 
-// The CPU-side result of loading a glTF file: a single merged mesh (all primitives baked into
-// world space and concatenated) plus a full metallic-roughness material (five maps + factors).
-// Assumes one material for the whole model, which holds for the DamagedHelmet sample.
+// A single glTF material's PBR factors (no maps). Used for multi-material models whose parts
+// differ only by factors (e.g. the car's body / tires / glass).
+struct SubMaterial {
+    glm::vec4 baseColorFactor{1.0f};
+    glm::vec3 emissiveFactor{0.0f};
+    float metallicFactor = 1.0f;
+    float roughnessFactor = 1.0f;
+    std::string name;
+};
+
+// A contiguous range of the merged index buffer that shares one material.
+struct Submesh {
+    uint32_t firstIndex = 0;
+    uint32_t indexCount = 0;
+    int material = -1;
+};
+
+// The CPU-side result of loading a glTF file: a single merged vertex/index buffer (all primitives
+// baked into world space and concatenated), split into submeshes by material. Textured models
+// (e.g. DamagedHelmet) use the single-material maps below; textureless multi-material models
+// (e.g. the car) are shaded per-submesh from `materials` factors.
 struct MeshData {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
+    std::vector<Submesh> submeshes;
+    std::vector<SubMaterial> materials;
+    bool hasTextures = false;
 
-    // PBR metallic-roughness material maps.
+    // Single-material maps (material 0), used for textured models via the shared descriptor set.
     TextureData baseColor;         // sRGB
     TextureData metallicRoughness; // linear: G = roughness, B = metallic
     TextureData normal;            // linear tangent-space normal map

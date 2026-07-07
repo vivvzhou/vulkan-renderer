@@ -5,7 +5,7 @@ abstraction layer hiding the driver. It implements a full deferred PBR pipeline,
 lighting, shadow mapping, multithreaded command recording, a hand-written GPU memory allocator,
 and a **neural** (compute-shader MLP) ambient-occlusion pass.
 
-![The renderer: a glossy red sports car in a dark garage, lit by a directional key light with image-based reflections and a shadow, and a live GPU per-pass timing readout in the title bar](docs/images/hero.png)
+![The renderer: a glossy black metallic sports car (multi-material: chrome wheels, glass, red taillights) in a dark garage, lit by a directional key light with image-based reflections and a shadow, and a live GPU per-pass timing readout in the title bar](docs/images/hero.png)
 
 > Built as a deep dive into the systems that underlie GPU drivers: explicit memory management,
 > synchronization, queue submission, SPIR-V, and pipeline-cache serialization — plus an ML
@@ -33,15 +33,17 @@ Loads glTF models (tinygltf) and HDR environments (stb) fetched automatically at
 ## What you're seeing
 
 A sports car (a glTF model in `assets/`) spinning on a dark, glossy floor in a workshop
-environment. The scene is deliberately dark: the environment lighting is dimmed and the visible
-background darkened, so the car is shaped by a bright directional key light while still catching
-the environment as reflections. Neural AO darkens the contact and crease regions, and a
+environment. The car is drawn as a **multi-material** mesh — glossy black metallic body, matte
+black tires, dark glass, polished chrome wheels, and glowing taillights — each part shaded from
+its own glTF material. The scene is deliberately dark: the environment lighting is dimmed and the
+visible background darkened, so the car is shaped by a bright directional key light while still
+catching the environment as reflections. Neural AO darkens the contact and crease regions, and a
 directional shadow grounds the car. The title bar shows measured GPU time per pass, e.g.
 `shadow 0.11  geom 0.16  neuralAO 1.5  light 0.07  total 1.8 ms`.
 
 The scene is data-driven — point `ASSET_PATH` / `ENV_HDR_PATH` (in `CMakeLists.txt`) at any glTF
-model and HDR environment to change it. (The bundled car is a Draco-decompressed model; the loader
-reads uncompressed glTF, and shades it as a single glossy paint since it is single-material.)
+model and HDR environment to change it. The mesh is split into submeshes by glTF material; the
+bundled car is a Draco-decompressed model (the loader reads uncompressed glTF).
 
 ## Architecture
 

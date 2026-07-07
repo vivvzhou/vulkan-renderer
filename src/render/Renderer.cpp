@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -97,13 +98,7 @@ Renderer::Renderer(Window& window, Device& device, DeviceAllocator& allocator, S
     modelCenter_ = model.center;
     modelRadius_ = model.radius;
     modelMinY_ = model.aabbMin.y;
-    // The car has many materials but our loader is single-material, so shade it as one glossy
-    // red car paint (flat-material path: emissiveFactor.w = 0 ignores the maps and uses geometry
-    // normals). This reads as a clean painted-car / concept-render look.
-    material_.baseColorFactor = glm::vec4(0.5f, 0.02f, 0.02f, 1.0f);
-    material_.emissiveFactor = glm::vec4(0.0f); // w = 0: flat material
-    material_.metallicFactor = 0.2f;
-    material_.roughnessFactor = 0.3f;
+    buildMeshSubDraws(model);
 
     // Dark, glossy showroom floor: near-black albedo with low roughness so it mirrors the
     // environment and the car. w = 0 selects the non-textured shading path.
@@ -1152,6 +1147,73 @@ void Renderer::createMesh(const MeshData& model) {
                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 }
 
+void Renderer::buildMeshSubDraws(const MeshData& model) {
+    auto contains = [](const std::string& s, const char* sub) {
+        std::string lower(s);
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return lower.find(sub) != std::string::npos;
+    };
+
+    // Name-based scheme for the textureless car: glossy black body, matte-black tires, dark glossy
+    // glass, glowing lights, polished-metal accents (see the plan / user choices).
+    auto carScheme = [&](const SubMaterial& m) {
+        MaterialPush p;
+        p.baseColorFactor = m.baseColorFactor;
+        p.emissiveFactor = glm::vec4(m.emissiveFactor, 0.0f); // w = 0: flat (no maps)
+        p.metallicFactor = m.metallicFactor;
+        p.roughnessFactor = m.roughnessFactor;
+        const std::string& n = m.name;
+        if (contains(n, "body")) {
+            p.baseColorFactor = glm::vec4(0.015f, 0.015f, 0.02f, 1.0f);
+            p.metallicFactor = 1.0f;
+            p.roughnessFactor = 0.30f;
+        } else if (contains(n, "tire") || contains(n, "rubber") || contains(n, "wheel")) {
+            p.baseColorFactor = glm::vec4(0.02f, 0.02f, 0.02f, 1.0f);
+            p.metallicFactor = 0.0f;
+            p.roughnessFactor = 0.9f;
+        } else if (contains(n, "glass")) {
+            if (contains(n, "taillight")) {
+                p.baseColorFactor = glm::vec4(0.3f, 0.0f, 0.0f, 1.0f);
+                p.emissiveFactor = glm::vec4(0.6f, 0.0f, 0.0f, 0.0f); // red glow
+                p.metallicFactor = 0.0f;
+                p.roughnessFactor = 0.1f;
+            } else {
+                p.baseColorFactor = glm::vec4(0.02f, 0.02f, 0.03f, 1.0f);
+                p.metallicFactor = 0.0f;
+                p.roughnessFactor = 0.05f;
+            }
+        } else if (contains(n, "led") || contains(n, "signal")) {
+            p.emissiveFactor = glm::vec4(glm::vec3(m.baseColorFactor) * 2.5f, 0.0f); // glow
+        } else if (contains(n, "chrome") || contains(n, "metal")) {
+            p.metallicFactor = 1.0f;
+            p.roughnessFactor = 0.2f;
+        } else {
+            p.metallicFactor = 0.1f; // interior / leather / plastic / colored trim: dark, matte
+            p.roughnessFactor = 0.6f;
+        }
+        return p;
+    };
+
+    meshSubDraws_.clear();
+    meshSubDraws_.reserve(model.submeshes.size());
+    for (const Submesh& s : model.submeshes) {
+        const size_t mi = s.material >= 0 ? static_cast<size_t>(s.material) : 0;
+        const SubMaterial& m = model.materials[mi];
+        MaterialPush push;
+        if (model.hasTextures) {
+            // Textured single-material models (e.g. the helmet): sample the shared maps.
+            push.baseColorFactor = m.baseColorFactor;
+            push.emissiveFactor = glm::vec4(m.emissiveFactor, 1.0f); // w = 1: sample textures
+            push.metallicFactor = m.metallicFactor;
+            push.roughnessFactor = m.roughnessFactor;
+        } else {
+            push = carScheme(m);
+        }
+        meshSubDraws_.push_back({s.firstIndex, s.indexCount, push});
+    }
+}
+
 void Renderer::createGround() {
     // A large flat quad at kGroundY, facing up. Indexed both windings so it's visible and casts
     // depth regardless of the pipeline's back-face culling.
@@ -1169,6 +1231,8 @@ void Renderer::createGround() {
                                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     groundIndexBuffer_ = createDeviceLocalBuffer(indices.data(), sizeof(uint32_t) * indices.size(),
                                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+
+    groundSubDraws_ = {{0, groundIndexCount_, groundMaterial_}};
 }
 
 void Renderer::createUniformBuffers() {
@@ -1436,14 +1500,10 @@ void Renderer::buildInstances(float time) {
         m = glm::rotate(m, time * glm::radians(20.0f) + phase, glm::vec3(0, 1, 0));
         m = glm::scale(m, glm::vec3(fit));
         m = glm::translate(m, -modelCenter_);
-        instances_.push_back({m, &vertexBuffer_, &indexBuffer_, indexCount_,
-                              material_.baseColorFactor, material_.emissiveFactor,
-                              material_.metallicFactor, material_.roughnessFactor});
+        instances_.push_back({m, &vertexBuffer_, &indexBuffer_, indexCount_, &meshSubDraws_});
     }
     instances_.push_back({groundModel_, &groundVertexBuffer_, &groundIndexBuffer_,
-                          groundIndexCount_, groundMaterial_.baseColorFactor,
-                          groundMaterial_.emissiveFactor, groundMaterial_.metallicFactor,
-                          groundMaterial_.roughnessFactor});
+                          groundIndexCount_, &groundSubDraws_});
 }
 
 void Renderer::recordGeometrySecondary(int threadIndex, uint32_t frame, VkExtent2D extent) {
@@ -1487,20 +1547,24 @@ void Renderer::recordGeometrySecondary(int threadIndex, uint32_t frame, VkExtent
 
     for (size_t idx = begin; idx < end; ++idx) {
         const DrawInstance& inst = instances_[idx];
-        MeshPush push{};
-        push.model = inst.model;
-        push.baseColorFactor = inst.baseColorFactor;
-        push.emissiveFactor = inst.emissiveFactor;
-        push.metallicFactor = inst.metallicFactor;
-        push.roughnessFactor = inst.roughnessFactor;
-        vkCmdPushConstants(sec, geomPipelineLayout_,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof(MeshPush), &push);
         const VkBuffer buffers[] = {inst.vertexBuffer->handle()};
         const VkDeviceSize offsets[] = {0};
         vkCmdBindVertexBuffers(sec, 0, 1, buffers, offsets);
         vkCmdBindIndexBuffer(sec, inst.indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(sec, inst.indexCount, 1, 0, 0, 0);
+
+        // One draw per material-homogeneous submesh, each with its own factors.
+        for (const SubDraw& sub : *inst.subDraws) {
+            MeshPush push{};
+            push.model = inst.model;
+            push.baseColorFactor = sub.material.baseColorFactor;
+            push.emissiveFactor = sub.material.emissiveFactor;
+            push.metallicFactor = sub.material.metallicFactor;
+            push.roughnessFactor = sub.material.roughnessFactor;
+            vkCmdPushConstants(sec, geomPipelineLayout_,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(MeshPush), &push);
+            vkCmdDrawIndexed(sec, sub.indexCount, 1, sub.firstIndex, 0, 0);
+        }
     }
 
     VK_CHECK(vkEndCommandBuffer(sec));
@@ -1565,7 +1629,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
         vkCmdPushConstants(cmd, shadowPipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(glm::mat4), &lightMvp);
         bindMesh(*inst.vertexBuffer, *inst.indexBuffer);
-        vkCmdDrawIndexed(cmd, inst.indexCount, 1, 0, 0, 0);
+        vkCmdDrawIndexed(cmd, inst.totalIndexCount, 1, 0, 0, 0);
     }
     vkCmdEndRenderPass(cmd);
     writeTs(1, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
