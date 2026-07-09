@@ -76,7 +76,7 @@ constexpr float kGroundY = -1.2f; // ground plane sits just below the fitted mes
 // Mesh instances (still partitioned across the recording threads).
 constexpr int kInstanceCount = 1;
 constexpr float kInstanceSpacing = 2.7f;
-constexpr float kInstanceScale = 1.45f; // fitted mesh radius after scaling
+constexpr float kInstanceScale = 1.85f; // fitted mesh radius after scaling
 
 std::vector<char> readFile(const std::string& path) {
     std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -1167,7 +1167,7 @@ void Renderer::buildMeshSubDraws(const MeshData& model) {
         if (contains(n, "body")) {
             p.baseColorFactor = glm::vec4(0.015f, 0.015f, 0.02f, 1.0f);
             p.metallicFactor = 1.0f;
-            p.roughnessFactor = 0.30f;
+            p.roughnessFactor = 0.12f; // low roughness -> sharp, mirror-like reflections
         } else if (contains(n, "tire") || contains(n, "rubber") || contains(n, "wheel")) {
             p.baseColorFactor = glm::vec4(0.02f, 0.02f, 0.02f, 1.0f);
             p.metallicFactor = 0.0f;
