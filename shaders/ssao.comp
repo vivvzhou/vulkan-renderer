@@ -1,0 +1,111 @@
+#version 450
+
+// Neural screen-space ambient occlusion. For each pixel we gather a fixed Fibonacci-disk set of
+// G-buffer samples, build the same scale-invariant feature vector the training script used
+// (per sample: the horizon cue max(dot(dir, N), 0) and the relative distance), then run a small
+// offline-trained MLP whose weights arrive as an SSBO. The result is written to an AO image the
+// lighting pass multiplies into the ambient term.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D gPosition; // xyz world position (a = coverage)
+layout(binding = 1) uniform sampler2D gNormal;   // xyz world normal
+layout(binding = 2) readonly buffer Weights { float w[]; };
+layout(binding = 3, r16f) uniform writeonly image2D outAo;
+
+const int K = 16;
+const int IN_DIM = 2 * K; // 32
+const int H1 = 32;
+const int H2 = 16;
+
+// SSBO offsets: W1, b1, W2, b2, W3, b3 (out-major, row-major weights).
+const int OFF_W1 = 0;
+const int OFF_B1 = OFF_W1 + H1 * IN_DIM; // 1024
+const int OFF_W2 = OFF_B1 + H1;          // 1056
+const int OFF_B2 = OFF_W2 + H2 * H1;     // 1568
+const int OFF_W3 = OFF_B2 + H2;          // 1584
+const int OFF_B3 = OFF_W3 + H2;          // 1600
+
+const float GOLDEN_ANGLE = 2.3999632297;      // pi * (3 - sqrt(5))
+const float RADIUS_PIXELS = 22.0;             // screen-space sampling radius
+
+vec2 diskOffset(int k) {
+    float r = sqrt((float(k) + 0.5) / float(K));
+    float a = float(k) * GOLDEN_ANGLE;
+    return vec2(r * cos(a), r * sin(a));
+}
+
+void main() {
+    ivec2 size = imageSize(outAo);
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x >= size.x || gid.y >= size.y) {
+        return;
+    }
+    vec2 uv = (vec2(gid) + 0.5) / vec2(size);
+
+    vec3 N = texture(gNormal, uv).xyz;
+    if (dot(N, N) < 0.5) {
+        imageStore(outAo, gid, vec4(1.0)); // background: fully lit
+        return;
+    }
+    N = normalize(N);
+    vec3 centerPos = texture(gPosition, uv).xyz;
+    vec2 radiusUv = vec2(RADIUS_PIXELS) / vec2(size);
+
+    // Gather samples, tracking valid (foreground) neighbours to normalize distances.
+    float cue[K];
+    float dist[K];
+    bool valid[K];
+    float meanDist = 0.0;
+    int validCount = 0;
+    for (int k = 0; k < K; ++k) {
+        vec2 sampleUv = uv + diskOffset(k) * radiusUv;
+        vec3 nNormal = texture(gNormal, sampleUv).xyz;
+        if (dot(nNormal, nNormal) < 0.5) {
+            valid[k] = false;
+            cue[k] = 0.0;
+            dist[k] = 0.0;
+            continue;
+        }
+        vec3 delta = texture(gPosition, sampleUv).xyz - centerPos;
+        float d = length(delta);
+        valid[k] = true;
+        dist[k] = d;
+        cue[k] = d > 1e-6 ? max(dot(delta / d, N), 0.0) : 0.0;
+        meanDist += d;
+        ++validCount;
+    }
+    meanDist = validCount > 0 ? meanDist / float(validCount) : 1.0;
+
+    // Feature vector: [cue_0..cue_15, rel_0..rel_15]. Invalid samples read as flat (no occlusion).
+    float x[IN_DIM];
+    for (int k = 0; k < K; ++k) {
+        x[k] = cue[k];
+        x[K + k] = valid[k] ? dist[k] / max(meanDist, 1e-6) : 1.0;
+    }
+
+    // MLP: relu(W1) -> relu(W2) -> sigmoid(W3).
+    float h1[H1];
+    for (int o = 0; o < H1; ++o) {
+        float s = w[OFF_B1 + o];
+        for (int i = 0; i < IN_DIM; ++i) {
+            s += w[OFF_W1 + o * IN_DIM + i] * x[i];
+        }
+        h1[o] = max(s, 0.0);
+    }
+    float h2[H2];
+    for (int o = 0; o < H2; ++o) {
+        float s = w[OFF_B2 + o];
+        for (int i = 0; i < H1; ++i) {
+            s += w[OFF_W2 + o * H1 + i] * h1[i];
+        }
+        h2[o] = max(s, 0.0);
+    }
+    float s = w[OFF_B3];
+    for (int i = 0; i < H2; ++i) {
+        s += w[OFF_W3 + i] * h2[i];
+    }
+    float ao = 1.0 / (1.0 + exp(-s));
+
+    imageStore(outAo, gid, vec4(ao));
+}

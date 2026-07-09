@@ -44,12 +44,6 @@ FetchContent_Declare(glm
   GIT_TAG        1.0.1
   GIT_SHALLOW    TRUE)
 
-FetchContent_Declare(vma
-  GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
-  GIT_TAG        v3.1.0
-  GIT_SHALLOW    TRUE
-  SOURCE_SUBDIR  __skip_cmake__)
-
 FetchContent_Declare(stb
   GIT_REPOSITORY https://github.com/nothings/stb.git
   GIT_TAG        master)
@@ -60,10 +54,20 @@ FetchContent_Declare(tinygltf
   GIT_SHALLOW    TRUE
   SOURCE_SUBDIR  __skip_cmake__)
 
-FetchContent_MakeAvailable(glfw glm vma stb tinygltf)
+FetchContent_MakeAvailable(glfw glm stb tinygltf)
 
-add_library(vma INTERFACE)
-target_include_directories(vma INTERFACE ${vma_SOURCE_DIR}/include)
+# Sports-car model, committed to the repo (a Draco-decompressed glTF the loader can read).
+set(ASSET_PATH "${CMAKE_SOURCE_DIR}/assets/sportscar.glb")
+message(STATUS "Model asset   : ${ASSET_PATH}")
+
+# HDR environment map for image-based lighting (CC0, Poly Haven). Not committed.
+set(ENV_HDR_NAME "autoshop_01_2k.hdr")
+FetchContent_Declare(envhdr
+  URL https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/${ENV_HDR_NAME}
+  DOWNLOAD_NO_EXTRACT TRUE)
+FetchContent_MakeAvailable(envhdr)
+set(ENV_HDR_PATH "${envhdr_SOURCE_DIR}/${ENV_HDR_NAME}")
+message(STATUS "Env HDR asset : ${ENV_HDR_PATH}")
 
 add_library(stb INTERFACE)
 target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})
@@ -80,20 +84,37 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
 # Application
 # ---------------------------------------------------------------------------
 add_executable(vkrenderer
-  src/main.cpp)
+  src/main.cpp
+  src/core/Window.cpp
+  src/core/ThreadPool.cpp
+  src/vk/Instance.cpp
+  src/vk/Device.cpp
+  src/vk/Swapchain.cpp
+  src/vk/DeviceAllocator.cpp
+  src/vk/Buffer.cpp
+  src/vk/Image.cpp
+  src/render/GltfLoader.cpp
+  src/render/Ibl.cpp
+  src/render/Renderer.cpp)
+
+target_include_directories(vkrenderer PRIVATE src)
 
 target_link_libraries(vkrenderer PRIVATE
   Vulkan::Vulkan
   glfw
   glm::glm
-  vma
   stb
   tinygltf)
 
 target_compile_definitions(vkrenderer PRIVATE
   GLM_FORCE_RADIANS
   GLM_FORCE_DEPTH_ZERO_TO_ONE
-  GLFW_INCLUDE_VULKAN)
+  GLFW_INCLUDE_VULKAN
+  SHADER_DIR="${CMAKE_BINARY_DIR}/shaders"
+  ASSET_PATH="${ASSET_PATH}"
+  ENV_HDR_PATH="${ENV_HDR_PATH}"
+  PIPELINE_CACHE_PATH="${CMAKE_BINARY_DIR}/pipeline_cache.bin"
+  SSAO_WEIGHTS_PATH="${CMAKE_SOURCE_DIR}/assets/ssao_mlp.bin")
 
 if(WIN32)
   target_compile_definitions(vkrenderer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -105,6 +126,12 @@ else()
   target_compile_options(vkrenderer PRIVATE -Wall -Wextra)
 endif()
 
-# Phase 1 will enable:
-# target_compile_shaders(vkrenderer
-#   SHADERS shaders/triangle.vert shaders/triangle.frag)
+target_compile_shaders(vkrenderer
+  SHADERS
+    shaders/gbuffer.vert shaders/gbuffer.frag
+    shaders/lighting.vert shaders/lighting.frag
+    shaders/shadow.vert
+    shaders/ibl_irradiance.comp
+    shaders/ibl_prefilter.comp
+    shaders/ibl_brdf.comp
+    shaders/ssao.comp)

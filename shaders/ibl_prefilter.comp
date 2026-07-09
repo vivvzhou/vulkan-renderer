@@ -1,0 +1,80 @@
+#version 450
+
+// Specular IBL: prefilter the environment with the GGX importance-sampled distribution for a
+// single roughness level (one mip of the output). Higher-roughness mips are blurrier. Output
+// is an equirectangular image; sampling direction = reflection vector.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D envMap;
+layout(binding = 1, rgba16f) uniform writeonly image2D outPrefilter;
+
+layout(push_constant) uniform PushConstants {
+    float roughness;
+} pc;
+
+const float PI = 3.14159265359;
+const vec2 invAtan = vec2(0.1591, 0.3183);
+
+vec2 dirToUv(vec3 d) {
+    vec2 uv = vec2(atan(d.z, d.x), asin(clamp(d.y, -1.0, 1.0)));
+    return uv * invAtan + 0.5;
+}
+vec3 uvToDir(vec2 uv) {
+    float phi = (uv.x - 0.5) * 2.0 * PI;
+    float theta = (uv.y - 0.5) * PI;
+    float ct = cos(theta);
+    return normalize(vec3(cos(phi) * ct, sin(theta), sin(phi) * ct));
+}
+
+// Van der Corput / Hammersley low-discrepancy sequence for importance sampling.
+float radicalInverseVdC(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+vec2 hammersley(uint i, uint n) { return vec2(float(i) / float(n), radicalInverseVdC(i)); }
+
+vec3 importanceSampleGGX(vec2 Xi, vec3 N, float roughness) {
+    float a = roughness * roughness;
+    float phi = 2.0 * PI * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    vec3 H = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+    return normalize(tangent * H.x + bitangent * H.y + N * H.z);
+}
+
+void main() {
+    ivec2 size = imageSize(outPrefilter);
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x >= size.x || gid.y >= size.y) {
+        return;
+    }
+    vec2 uv = (vec2(gid) + 0.5) / vec2(size);
+    vec3 N = uvToDir(uv);
+    vec3 R = N;
+    vec3 V = N; // isotropic assumption: view = reflection = normal
+
+    const uint SAMPLES = 256u;
+    vec3 color = vec3(0.0);
+    float totalWeight = 0.0;
+    for (uint i = 0u; i < SAMPLES; ++i) {
+        vec2 Xi = hammersley(i, SAMPLES);
+        vec3 H = importanceSampleGGX(Xi, N, pc.roughness);
+        vec3 L = normalize(2.0 * dot(V, H) * H - V);
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL > 0.0) {
+            color += texture(envMap, dirToUv(L)).rgb * NdotL;
+            totalWeight += NdotL;
+        }
+    }
+    color = totalWeight > 0.0 ? color / totalWeight : texture(envMap, dirToUv(N)).rgb;
+    imageStore(outPrefilter, gid, vec4(color, 1.0));
+}
